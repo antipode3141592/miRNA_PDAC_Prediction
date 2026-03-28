@@ -1,0 +1,115 @@
+---
+title: "Final Project - PDAC Data Analysis"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+setwd("~/Classes/BMI7235 - Machine Learning/Final Project")
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(tableone)
+
+```
+
+```{r}
+
+# Import data
+metadata <- read_xlsx("GSE314577/GSE314577_VUMC_Metadata_ch_revised.xlsx")
+
+# Inspect the metadata structure
+names(metadata)
+head(metadata, 3)
+
+# Table One
+demo <- metadata %>%
+    transmute(
+        CC = factor(CC),
+        Sex = factor(Sex),
+        Race = factor(Race),
+        Age = as.numeric(age_sam)
+    )
+
+sex_counts_by_cc <- demo %>%
+    count(CC, Sex, .drop = FALSE) %>%
+    pivot_wider(names_from = CC, values_from = n, values_fill = 0)
+
+race_counts_by_cc <- demo %>%
+    count(CC, Race, .drop = FALSE) %>%
+    pivot_wider(names_from = CC, values_from = n, values_fill = 0)
+
+age_summary <- demo %>%
+    group_by(CC) %>%
+    summarise(
+        Min = min(Age, na.rm = TRUE),
+        Max = max(Age, na.rm = TRUE),
+        Median = median(Age, na.rm = TRUE),
+        Mean = mean(Age, na.rm = TRUE),
+        SD = sd(Age, na.rm = TRUE),
+        .groups = "drop"
+    )
+
+# Histogram of Age
+png("age_histogram.png", width = 6 * 72, height = 5 * 72)
+hist(
+    demo$Age,
+    main = "Histogram of Age Distribution",
+    xlab = "Age",
+    breaks = 10
+)
+dev.off()
+
+age_summary_total <- demo %>%
+    summarise(
+        CC = "Total",
+        Min = min(Age, na.rm = TRUE),
+        Max = max(Age, na.rm = TRUE),
+        Median = median(Age, na.rm = TRUE),
+        Mean = mean(Age, na.rm = TRUE),
+        SD = sd(Age, na.rm = TRUE)
+    )
+
+tableone_vars <- c("Sex", "Race", "Age")
+tableone_factor_vars <- c("Sex", "Race")
+tableone_obj <- CreateTableOne(
+    vars = tableone_vars,
+    strata = "CC",
+    data = demo,
+    factorVars = tableone_factor_vars,
+    addOverall = TRUE
+)
+
+sex_counts_by_cc
+race_counts_by_cc
+age_summary
+age_summary_total
+
+tableone_mat <- print(
+    tableone_obj,
+    showAllLevels = TRUE,
+    quote = FALSE,
+    noSpaces = TRUE,
+    test = TRUE,
+    smd = TRUE,
+    printToggle = FALSE
+)
+print(tableone_mat)
+
+write.csv(tableone_mat, "tableone_pdac.csv", row.names = TRUE)
+tableone_html <- knitr::kable(
+    tableone_mat,
+    format = "html",
+    table.attr = "class=\"table table-striped\""
+)
+writeLines(tableone_html, "tableone_pdac.html")
+
+# for each variable, get the count of missing values
+missing_counts <- sapply(demo, function(x) sum(is.na(x)))
+print(missing_counts)
+
+```
