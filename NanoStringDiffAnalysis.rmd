@@ -1,0 +1,121 @@
+---
+title: "Final Project - "
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+setwd("~/Classes/BMI7235 - Machine Learning/Final Project")
+
+library(NanoStringDiff)
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(tableone)
+
+```
+
+## Import Data
+GEO Series Matrix files are not in a standard tabular format, so we will read it as lines and then parse it. The raw counts, normalized counts, and metadata are in Excel format, which we can read directly.
+
+
+Adapted from the example code:
+https://bioconductor.org/packages/release/bioc/vignettes/NanoStringDiff/inst/doc/NanoStringDiff.R
+And the documentation here:
+https://bioconductor.org/packages/release/bioc/vignettes/NanoStringDiff/inst/doc/NanoStringDiff.pdf
+
+```{r}
+
+# Import data
+geo_series_lines <- readLines("GSE314577/GSE314577_series_matrix.txt")
+raw_counts <- read_xlsx("GSE314577/GSE314577_VUMC_miRNA_raw_data.xlsx")
+# normalized_counts <- read_xlsx("GSE314577/GSE314577_VUMC_miRNA_normalized_data.xlsx")
+metadata <- read_xlsx("GSE314577/GSE314577_VUMC_Metadata_ch_revised.xlsx")
+
+# Inspect the raw data structure
+names(raw_counts)
+head(raw_counts, 3)
+names(metadata)
+head(metadata, 3)
+
+# Build NanoStringDiff input matrices from the raw miRNA table.
+sample_id_col <- "ID"
+miRNA_cols <- grep("^MIMAT", names(raw_counts), value = TRUE)
+if (length(miRNA_cols) == 0) {
+    stop("No MIMAT columns found in raw_counts.")
+}
+
+sample_ids <- as.character(raw_counts[[sample_id_col]])
+count_mat <- as.matrix(raw_counts[, miRNA_cols])
+rownames(count_mat) <- sample_ids
+
+# NanoStringDiff expects features as rows and samples as columns.
+endogenous <- t(count_mat)
+colnames(endogenous) <- sample_ids
+
+# If control probe columns are absent, use empty matrices as placeholders.
+positive <- matrix(numeric(0), nrow = 0, ncol = ncol(endogenous))
+negative <- matrix(numeric(0), nrow = 0, ncol = ncol(endogenous))
+housekeeping <- matrix(numeric(0), nrow = 0, ncol = ncol(endogenous))
+colnames(positive) <- colnames(endogenous)
+colnames(negative) <- colnames(endogenous)
+colnames(housekeeping) <- colnames(endogenous)
+```
+
+```{r}
+# Build designs from metadata by matching the ID column to sample_ids.
+metadata_cols <- names(metadata)
+overlap_counts <- sapply(metadata_cols, function(col_name) {
+    col_values <- metadata[[col_name]]
+    if (is.factor(col_values) || is.character(col_values)) {
+        sum(as.character(col_values) %in% sample_ids, na.rm = TRUE)
+    } else {
+        0
+    }
+})
+
+id_col <- metadata_cols[which.max(overlap_counts)]
+if (length(id_col) == 0 || overlap_counts[[id_col]] == 0) {
+    stop("Could not find a metadata column that matches sample IDs.")
+}
+
+metadata_ids <- as.character(metadata[[id_col]])
+designs <- metadata[match(sample_ids, metadata_ids), setdiff(metadata_cols, id_col), drop = FALSE]
+designs <- as.data.frame(designs)
+rownames(designs) <- sample_ids
+
+```
+
+```{r}
+# Create NanoStringSet object
+
+NanoStringDataset <- createNanoStringSet(
+    endogenous,
+    positive,
+    negative,
+    housekeeping,
+    designs
+)
+NanoStringDataset
+pData(NanoStringDataset)
+head(exprs(NanoStringDataset))
+
+```
+
+```{r, include=FALSE}
+
+# Quick sanity checks
+dim(endogenous)
+anyNA(endogenous)
+any(duplicated(rownames(endogenous)))
+any(duplicated(colnames(endogenous)))
+all(colnames(endogenous) %in% rownames(designs))
+sum(is.na(match(colnames(endogenous), rownames(designs))))
+head(designs)
+
+```
+
+
