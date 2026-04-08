@@ -1,5 +1,5 @@
 ---
-title: "Final Project - "
+title: "Final Project - Predicting PDAC with Circulating miRNA"
 date: "`r Sys.Date()`"
 output: html_document
 ---
@@ -19,6 +19,28 @@ library(pROC)
 library(dplyr)
 library(rpart)
 library(randomForest)
+
+render_html_table <- function(data, caption = NULL, digits = NULL) {
+  kable_args <- list(
+    x = data,
+    format = "html",
+    row.names = FALSE,
+    caption = caption
+  )
+
+  if (!is.null(digits)) {
+    kable_args$digits <- digits
+  }
+
+  cat(
+    do.call(knitr::kable, kable_args),
+    sep = "\n"
+  )
+}
+
+model_display_name <- function(model_name) {
+  tools::toTitleCase(gsub("_", " ", model_name))
+}
 
 ```
 
@@ -50,7 +72,7 @@ association_cols <- c("miRNA", "estimate", "odds_ratio", "std_error", "z_value",
 ## Import Data
 We use the normalized miRNA count matrix from GEO and merge it with the demographic metadata.
 
-```{r}
+```{r, include=FALSE}
 
 normalized_counts <- read_xlsx("GSE314577/GSE314577_VUMC_miRNA_normalized_data.xlsx")
 metadata <- read_xlsx("GSE314577/GSE314577_VUMC_Metadata_ch_revised.xlsx")
@@ -82,7 +104,7 @@ cat("Number of miRNA columns:", length(miRNA_cols), "\n")
 ## Create Training and Holdout Sets
 To properly split the data while respecting the matched-pairs, we will perform a training/holdout split at the level of matched sets, ensuring that all samples from a given matched set are either in the training set or holdout set, but not both.
 
-```{r}
+```{r, echo=FALSE, results='asis'}
 
 all_sets <- unique(full_dat$matched_set)
 n_train_sets <- floor(0.8 * length(all_sets))
@@ -91,12 +113,29 @@ train_set_ids <- sample(all_sets, n_train_sets)
 train_set <- full_dat %>% filter(matched_set %in% train_set_ids)
 holdout  <- full_dat %>% filter(!matched_set %in% train_set_ids)
 
-cat("Training rows:", nrow(train_set), "\n")
-cat("Holdout rows:", nrow(holdout), "\n")
-cat("Training class balance:\n")
-print(table(train_set$CC))
-cat("Holdout class balance:\n")
-print(table(holdout$CC))
+split_summary <- data.frame(
+  dataset = c("Training", "Holdout"),
+  rows = c(nrow(train_set), nrow(holdout)),
+  row.names = NULL
+)
+
+class_balance <- bind_rows(
+  data.frame(
+    dataset = "Training",
+    class = names(table(train_set$CC)),
+    n_samples = as.integer(table(train_set$CC)),
+    row.names = NULL
+  ),
+  data.frame(
+    dataset = "Holdout",
+    class = names(table(holdout$CC)),
+    n_samples = as.integer(table(holdout$CC)),
+    row.names = NULL
+  )
+)
+
+render_html_table(split_summary, caption = "Training and holdout set sizes")
+render_html_table(class_balance, caption = "Training and holdout class balance")
 
 ```
 
@@ -303,7 +342,7 @@ run_fold_dt <- function(fold_inputs, cp_dt = 0.01, maxdepth = 10) {
 }
 
 ```
-```{r}
+```{r, include=FALSE}
 
 # Feature filter
 #  The top N miRNAs are selected based on the highest SNR values, with ties broken by p-value from two-sample t-test
@@ -465,7 +504,7 @@ prepare_fold_inputs <- function(train_fold_dat, valid_fold_dat, selected_miRNA) 
 }
 ```
 
-```{r}
+```{r, include=FALSE}
 
 cv_set_ids <- unique(train_set$matched_set)
 k <- 5
@@ -575,37 +614,76 @@ write.csv(cv_summary,
 
 ```
 
+```{r, echo=FALSE, results='asis'}
+
+render_html_table(
+  cv_summary %>% arrange(desc(cv_auc)),
+  caption = "Cross-validation AUC and accuracy by model",
+  digits = 3
+)
+
+```
+
 
 ### Stable Features in CV Folds
 Summarize feature selection stability across folds for each model
 
-```{r}
+```{r, echo=FALSE, results='asis'}
 
 for (model_name in model_names) {
+  display_name <- model_display_name(model_name)
   feature_counts <- sort(table(unlist(feature_tracker[[model_name]])), decreasing = TRUE)
 
-  cat("Top stable features for", model_name, ":\n")
+  cat("#### ", display_name, "\n\n", sep = "")
+
   if (length(feature_counts) == 0) {
-    cat("No features were selected for this model in any fold.\n")
+    cat("<p>No features were selected for this model in any fold.</p>\n")
   } else {
-    print(head(feature_counts, 20))
+    stable_features <- data.frame(
+      miRNA = names(head(feature_counts, 20)),
+      n_folds_selected = as.integer(head(feature_counts, 20)),
+      row.names = NULL
+    )
+    render_html_table(
+      stable_features,
+      caption = paste("Top stable features for", display_name)
+    )
   }
 
-  cat("Number of selected features by fold for", model_name, ":\n")
-  print(feature_count_tracker[[model_name]])
+  fold_feature_counts <- data.frame(
+    fold = seq_along(feature_count_tracker[[model_name]]),
+    n_selected_features = feature_count_tracker[[model_name]],
+    row.names = NULL
+  )
+  render_html_table(
+    fold_feature_counts,
+    caption = paste("Selected feature counts by fold for", display_name)
+  )
 
-  cat("Tuning summary for", model_name, ":\n")
-  print(bind_rows(tuning_tracker[[model_name]]))
+  tuning_summary <- bind_rows(tuning_tracker[[model_name]])
+  render_html_table(
+    tuning_summary,
+    caption = paste("Tuning summary for", display_name),
+    digits = 3
+  )
 }
 
-cat("Number of", fold_filter_name, "-selected miRNAs by fold:\n")
-print(filter_sizes)
+fold_filter_summary <- data.frame(
+  fold = seq_along(filter_sizes),
+  n_selected_miRNA = filter_sizes,
+  row.names = NULL
+)
+
+render_html_table(
+  fold_filter_summary,
+  caption = paste("Number of", fold_filter_name, "selected miRNAs by fold")
+)
 
 ```
 
 ## Training/Holdout Evaluation
 
-```{r}
+```{r, echo=FALSE, results='asis'}
 
 filter_out_final <- fold_filter_fn(
   train_fold_dat = train_set,
@@ -618,7 +696,14 @@ final_fold_inputs <- prepare_fold_inputs(
   filter_out_final$selected
 )
 
-cat("Number of final", fold_filter_name, "-selected miRNAs:", length(filter_out_final$selected), "\n")
+cat(
+  "<p>Number of final ",
+  fold_filter_name,
+  " selected miRNAs: ",
+  length(filter_out_final$selected),
+  "</p>\n",
+  sep = ""
+)
 
 final_model_outputs <- list(
   forward_step = run_fold_forward_step(
@@ -667,10 +752,15 @@ holdout_summary <- holdout_predictions %>%
     .groups = "drop"
   )
 
-print(holdout_summary %>% arrange(desc(.data$test_auc)))
 write.csv(holdout_summary,
           "Tables/Holdout Summary.csv",
           row.names = FALSE)
+
+render_html_table(
+  holdout_summary %>% arrange(desc(.data$test_auc)),
+  caption = "Holdout AUC and accuracy by model",
+  digits = 3
+)
 
 final_model_diagnostics <- bind_rows(lapply(model_names, function(model_name) {
   model_out <- final_model_outputs[[model_name]]
@@ -682,19 +772,27 @@ final_model_diagnostics <- bind_rows(lapply(model_names, function(model_name) {
     )
 }))
 
-print(final_model_diagnostics %>%
-  select(tidyselect::all_of(c("model", "n_prob", "n_selected_features"))))
+diagnostic_summary <- final_model_diagnostics %>%
+  select(tidyselect::all_of(c("model", "n_prob", "n_selected_features")))
+
+render_html_table(
+  diagnostic_summary,
+  caption = "Final model diagnostics"
+)
 
 holdout_feature_summary <- final_model_diagnostics %>%
   select(tidyselect::all_of(c("model", "n_selected_features")))
 
-print(holdout_feature_summary)
+render_html_table(
+  holdout_feature_summary,
+  caption = "Selected feature counts in final holdout models"
+)
 
 ```
 
 ## Per-miRNA Logistic Regression Analysis
 
-```{r}
+```{r, echo=FALSE, results='asis'}
 
 interpretation_fn <- function(
   train_dat,
@@ -788,17 +886,22 @@ association_out <- interpretation_fn(
 
 association_results <- association_out$results
 
-print(head(association_results))
 write.csv(association_results,
           "Tables/Per-miRNA Logistic Regression Results.csv",
           row.names = FALSE)
+
+render_html_table(
+  association_results,
+  caption = "Per-miRNA logistic regression results",
+  digits = 3
+)
 
 ```
 
 ## Calibration Curves and Additional Metrics
 Reliability diagrams (calibration curves) and Brier scores for each model on the holdout set
 
-```{r}
+```{r, echo=FALSE, results='asis', fig.width=7, fig.height=5}
 
 calibration_summary <- holdout_predictions %>%
   group_by(.data$model) %>%
@@ -825,6 +928,8 @@ calibration_plot_data <- holdout_predictions %>%
   ) %>%
   filter(!is.na(.data$mean_prob), !is.na(.data$observed_rate))
 
+calibration_plots <- list()
+
 for (model_name in model_names) {
   calibration_data <- calibration_plot_data %>%
     filter(.data$model == model_name)
@@ -832,36 +937,47 @@ for (model_name in model_names) {
     filter(.data$model == model_name) %>%
     pull("brier_score")
 
-  # Save calibration plot
-  png(
-    paste0("calibration_curve_", model_name, ".png"),
-    width = 7 * 72,
-    height = 5 * 72
+  calibration_plot <- ggplot(calibration_data, aes(x = mean_prob, y = observed_rate)) +
+    geom_point(aes(size = n)) +
+    geom_line() +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray40") +
+    coord_equal(xlim = c(0, 1), ylim = c(0, 1)) +
+    labs(
+      title = paste("Calibration Curve -", model_name),
+      subtitle = paste("Brier score =", round(brier_score, 4)),
+      x = "Mean Predicted Probability",
+      y = "Observed Event Rate",
+      size = "Bin N"
+    ) +
+    theme_minimal()
+
+  calibration_plots[[model_name]] <- calibration_plot
+
+  ggsave(
+    filename = paste0("calibration_curve_", model_name, ".png"),
+    plot = calibration_plot,
+    width = 7,
+    height = 5,
+    units = "in",
+    dpi = 72
   )
-  print(
-    ggplot(calibration_data, aes(x = mean_prob, y = observed_rate)) +
-      geom_point(aes(size = n)) +
-      geom_line() +
-      geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray40") +
-      coord_equal(xlim = c(0, 1), ylim = c(0, 1)) +
-      labs(
-        title = paste("Calibration Curve -", model_name),
-        subtitle = paste("Brier score =", round(brier_score, 4)),
-        x = "Mean Predicted Probability",
-        y = "Observed Event Rate",
-        size = "Bin N"
-      ) +
-      theme_minimal()
-  )
-  dev.off()
 }
 
-# Show Brier scores for all models
 calibration_summary <- calibration_summary %>%
   arrange(.data$brier_score)
-print(calibration_summary)
 
 write.csv(calibration_summary, "Tables/Calibration Summary.csv", row.names = FALSE)
+
+render_html_table(
+  calibration_summary,
+  caption = "Brier scores by model",
+  digits = 4
+)
+
+for (model_name in model_names) {
+  cat("### ", model_display_name(model_name), "\n\n", sep = "")
+  print(calibration_plots[[model_name]])
+}
 
 ```
 
@@ -869,10 +985,14 @@ write.csv(calibration_summary, "Tables/Calibration Summary.csv", row.names = FAL
 # Interpretation and Visualization
 ROC curve comparison of all models on the test set.
 
-```{r}
+```{r, echo=FALSE, results='asis', fig.width=7, fig.height=5}
 
 # ROC curve plot with all six models on the holdout set
-print(holdout_summary %>% arrange(desc(.data$test_auc)))
+render_html_table(
+  holdout_summary %>% arrange(desc(.data$test_auc)),
+  caption = "Holdout ROC performance summary",
+  digits = 3
+)
 
 roc_curves <- lapply(model_names, function(model_name) {
   roc(holdout$CC_bin, final_model_outputs[[model_name]]$prob, quiet = TRUE)
@@ -913,17 +1033,23 @@ roc_curve_plot <- ggplot(
   ) +
   theme_minimal()
 
+ggsave(
+  filename = "roc_curve_comparison.png",
+  plot = roc_curve_plot,
+  width = 7,
+  height = 5,
+  units = "in",
+  dpi = 72
+)
+
 print(roc_curve_plot)
-png("roc_curve_comparison.png", width = 7 * 72, height = 5 * 72)
-print(roc_curve_plot)
-dev.off()
 
 
 ```
 
 # Selected miRNA Features and Interpretation
 
-```{r}
+```{r, echo=FALSE, results='asis'}
 
 # final feature counts across all models:
 # create a table of all miRNA features selected by any final model, with a count of how many models selected each feature, sorted by count and then alphabetically
@@ -950,8 +1076,12 @@ final_model_feature_counts <- final_selected_features %>%
   count(miRNA, name = "n_models_selected") %>%
   arrange(desc(n_models_selected), miRNA)
 
-print(final_model_feature_counts)
 write.csv(final_model_feature_counts, "Tables/Final Model Feature Counts.csv", row.names = FALSE)
+
+render_html_table(
+  final_model_feature_counts,
+  caption = "Counts of models selecting each miRNA"
+)
 
 if (nrow(final_model_feature_counts) == 0) {
   stop("No miRNAs were selected by any final model.", call. = TRUE)
@@ -962,16 +1092,26 @@ top_ranked_miRNA <- final_model_feature_counts %>%
   arrange(miRNA)
 top_rank_count <- top_ranked_miRNA$n_models_selected[[1]]
 
-cat("Top-rank selection count:", top_rank_count, "of", length(model_names), "models\n")
-cat("Top-ranked miRNAs:", paste(top_ranked_miRNA$miRNA, collapse = ", "), "\n")
-print(top_ranked_miRNA)
+cat(
+  "<p>Top-rank selection count: ",
+  top_rank_count,
+  " of ",
+  length(model_names),
+  " models</p>\n",
+  sep = ""
+)
+
+render_html_table(
+  top_ranked_miRNA,
+  caption = "Top-ranked consensus miRNAs"
+)
 
 ```
 
 # Final Summary Table of Consensus Features
 A table of all miRNAs selected by any final model, with their filter statistics, logistic regression results, model selection counts, and annotation names.
 
-```{r}
+```{r, echo=FALSE, results='asis'}
 
 # table of consensus features, with logistic-regression results,
 # model selection counts, filter stats, and annotation names
@@ -989,22 +1129,43 @@ final_feature_table <- data.frame(miRNA = top_ranked_miRNA$miRNA, row.names = NU
   left_join(select(gpl, miRNA = MIMAT, Annotation), by = "miRNA") %>%
   arrange(adj_p_value)
 
-print(final_feature_table)
-
 write.csv(final_feature_table, "Tables/Final Consensus Features.csv", row.names = FALSE)
+
+render_html_table(
+  final_feature_table,
+  caption = "Consensus feature summary",
+  digits = 3
+)
 
 ```
 
 ## Association Plot of Final Consensus Features
 Logistic-regression association plot of final consensus features, colored by class SNR
-```{r}
+```{r, echo=FALSE, fig.width=7, fig.height=5}
 
-png("Figures/Association Plot Final Features.png", width = 7 * 72, height = 5 * 72)
-ggplot(final_feature_table, aes(x = estimate, y = -log10(adj_p_value), color = class_snr)) +
+association_plot <- ggplot(
+  final_feature_table,
+  aes(x = estimate, y = -log10(adj_p_value), color = class_snr)
+) +
   geom_point() +
   scale_color_gradient(low = "blue", high = "red", na.value = "grey") +
-  labs(title = "Association Plot of Final Consensus Features", x = "Log-Odds Coefficient", y = "-Log10 Adjusted P-Value", color = "Class SNR") +
+  labs(
+    title = "Association Plot of Final Consensus Features",
+    x = "Log-Odds Coefficient",
+    y = "-Log10 Adjusted P-Value",
+    color = "Class SNR"
+  ) +
   theme_minimal()
-dev.off()
+
+print(association_plot)
+
+ggsave(
+  filename = "Figures/Association Plot Final Features.png",
+  plot = association_plot,
+  width = 7,
+  height = 5,
+  units = "in",
+  dpi = 72
+)
 
 ```
