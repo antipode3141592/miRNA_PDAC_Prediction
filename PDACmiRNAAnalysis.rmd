@@ -22,176 +22,6 @@ library(randomForest)
 
 ```
 
-```{r helpers, include=FALSE}
-
-# Prepare the training and evaluation datasets for model fitting based on the selected miRNAs from the fold-specific feature filter. This includes creating the model matrices and formulas needed for each model runner function.
-prepare_fold_inputs <- function(train_fold_dat, valid_fold_dat, selected_miRNA) {
-  train_fold_dat$CC_bin <- ifelse(train_fold_dat$CC == "PDAC case", 1, 0)
-  valid_fold_dat$CC_bin <- ifelse(valid_fold_dat$CC == "PDAC case", 1, 0)
-
-  if (!length(selected_miRNA)) {
-    stop("prepare_fold_inputs failed: feature filtering returned zero miRNAs.", call. = FALSE)
-  }
-
-  complete_feature_mask <- 
-    colSums(is.na(train_fold_dat[, selected_miRNA, drop = FALSE])) == 0 &
-      colSums(is.na(valid_fold_dat[, selected_miRNA, drop = FALSE])) == 0
-  selected_miRNA <- selected_miRNA[complete_feature_mask]
-
-  if (!length(selected_miRNA)) {
-    stop("prepare_fold_inputs failed: all selected miRNAs were removed after screening for complete data in both training and evaluation sets.", call. = FALSE)
-  }
-
-  keep_cols <- c("CC", "CC_bin", selected_miRNA)
-  train_model_dat <- train_fold_dat[, keep_cols, drop = FALSE]
-  valid_model_dat <- valid_fold_dat[, keep_cols, drop = FALSE]
-  model_formula <- stats::reformulate(selected_miRNA, response = "CC_bin")
-  class_formula <- stats::reformulate(selected_miRNA, response = "CC")
-
-  list(
-    selected_miRNA = selected_miRNA,
-    model_formula = model_formula,
-    class_formula = class_formula,
-    x_train = stats::model.matrix(model_formula, data = train_model_dat)[, -1, drop = FALSE],
-    x_valid = stats::model.matrix(model_formula, data = valid_model_dat)[, -1, drop = FALSE],
-    y_train = train_model_dat$CC_bin,
-    train_model_dat = train_model_dat,
-    valid_model_dat = valid_model_dat
-  )
-}
-
-# Feature filter
-#  The top N miRNAs are selected based on the highest SNR values, with ties broken by p-value from t-test
-filter_fold_class_snr <- function(train_fold_dat, miRNA_cols, top_n = 50) {
-  control_rows <- train_fold_dat$CC == "Controls"
-  case_rows <- train_fold_dat$CC == "PDAC case"
-
-  if (!any(control_rows) || !any(case_rows)) {
-    stop("filter_fold_class_snr failed: the training fold does not contain both control and PDAC case samples.", call. = FALSE)
-  }
-
-  control_mat <- train_fold_dat[control_rows, miRNA_cols, drop = FALSE]
-  case_mat <- train_fold_dat[case_rows, miRNA_cols, drop = FALSE]
-
-  class_stats <- data.frame(
-    miRNA = miRNA_cols,
-    mean_control = colMeans(control_mat, na.rm = TRUE),
-    mean_case = colMeans(case_mat, na.rm = TRUE),
-    sd_control = apply(control_mat, 2, sd, na.rm = TRUE),
-    sd_case = apply(case_mat, 2, sd, na.rm = TRUE),
-    row.names = NULL
-  )
-
-  class_stats$mean_diff <- class_stats$mean_case - class_stats$mean_control
-  class_stats$class_snr <- with(
-    class_stats,
-    ifelse(sd_case + sd_control > 0, abs(mean_diff) / (sd_case + sd_control), NA_real_)
-  )
-
-  t_test_stats <- t(vapply(
-    miRNA_cols,
-    function(miRNA) {
-      test_out <- try(
-        stats::t.test(case_mat[[miRNA]], control_mat[[miRNA]]),
-        silent = TRUE
-      )
-
-      if (inherits(test_out, "try-error")) {
-        return(c(t_stat = NA_real_, p_value = NA_real_))
-      }
-
-      c(
-        t_stat = unname(test_out$statistic),
-        p_value = test_out$p.value
-      )
-    },
-    numeric(2)
-  ))
-
-  class_stats$t_stat <- t_test_stats[, "t_stat"]
-  class_stats$p_value <- t_test_stats[, "p_value"]
-
-  class_stats <- class_stats[
-    stats::complete.cases(class_stats[, c("class_snr", "p_value")]),
-    ,
-    drop = FALSE
-  ]
-
-  if (nrow(class_stats) == 0) {
-    stop("filter_fold_class_snr failed: no miRNAs had usable class SNR and p-value statistics after filtering.", call. = FALSE)
-  }
-
-  class_stats <- class_stats[order(-class_stats$class_snr, class_stats$p_value), , drop = FALSE]
-
-  selected <- head(class_stats$miRNA, top_n)
-
-  if (!length(selected)) {
-    stop("filter_fold_class_snr failed: ranking produced zero selected miRNAs.", call. = FALSE)
-  }
-
-  list(
-    stats = class_stats,
-    selected = selected
-  )
-}
-
-run_fold_class_snr <- function(train_fold_dat, miRNA_cols, top_n = 50) {
-  # Ensure binary outcome is coded consistently
-  train_fold_dat$CC <- factor(train_fold_dat$CC, levels = c("Controls", "PDAC case"))
-
-  # Compute class-specific summary statistics for each miRNA
-  class_stats <- data.frame(
-    miRNA = miRNA_cols,
-    mean_case = sapply(train_fold_dat[, miRNA_cols, drop = FALSE], function(x) {
-      mean(x[train_fold_dat$CC == "PDAC case"], na.rm = TRUE)
-    }),
-    mean_control = sapply(train_fold_dat[, miRNA_cols, drop = FALSE], function(x) {
-      mean(x[train_fold_dat$CC == "Controls"], na.rm = TRUE)
-    }),
-    sd_case = sapply(train_fold_dat[, miRNA_cols, drop = FALSE], function(x) {
-      sd(x[train_fold_dat$CC == "PDAC case"], na.rm = TRUE)
-    }),
-    sd_control = sapply(train_fold_dat[, miRNA_cols, drop = FALSE], function(x) {
-      sd(x[train_fold_dat$CC == "Controls"], na.rm = TRUE)
-    }),
-    row.names = NULL
-  )
-
-  # Difference in means
-  class_stats$mean_diff <- class_stats$mean_case - class_stats$mean_control
-
-  # Classic two-class signal-to-noise ratio
-  class_stats$class_snr <- with(
-    class_stats,
-    ifelse(
-      (sd_case + sd_control) > 0,
-      abs(mean_diff) / (sd_case + sd_control),
-      NA_real_
-    )
-  )
-
-  # Secondary ranking statistic: ordinary two-sample t-test p-value
-  class_stats$p_value <- sapply(class_stats$miRNA, function(m) {
-    x <- train_fold_dat[[m]]
-    tryCatch(
-      t.test(x ~ train_fold_dat$CC)$p.value,
-      error = function(e) NA_real_
-    )
-  })
-
-  # Clean and rank
-  class_stats <- class_stats[is.finite(class_stats$class_snr) & is.finite(class_stats$p_value), ]
-  class_stats <- class_stats[order(-class_stats$class_snr, class_stats$p_value), ]
-
-  selected <- head(class_stats$miRNA, top_n)
-
-  list(
-    stats = class_stats,
-    selected = selected
-  )
-}
-```
-
 ```{r constants, include=FALSE}
 # constants and model parameters
 
@@ -475,7 +305,167 @@ run_fold_dt <- function(fold_inputs, cp_dt = 0.01, maxdepth = 10) {
 ```
 ```{r}
 
-fold_filter_fn <- run_fold_class_snr
+# Feature filter
+#  The top N miRNAs are selected based on the highest SNR values, with ties broken by p-value from two-sample t-test
+fold_filter_fn <- function(train_fold_dat, miRNA_cols, top_n = 50) {
+  case_stats <- train_fold_dat %>%
+    filter(.data$CC == "PDAC case") %>%
+    summarise(
+      across(
+        tidyselect::all_of(miRNA_cols),
+        list(
+          mean = ~ mean(.x, na.rm = TRUE),
+          sd = ~ sd(.x, na.rm = TRUE)
+        )
+      )
+    ) %>%
+    pivot_longer(
+      cols = everything(),
+      names_to = c("miRNA", ".value"),
+      names_sep = "_"
+    ) %>%
+    rename(
+      mean_case = mean,
+      sd_case = sd
+    )
+
+  control_stats <- train_fold_dat %>%
+    filter(.data$CC == "Controls") %>%
+    summarise(
+      across(
+        tidyselect::all_of(miRNA_cols),
+        list(
+          mean = ~ mean(.x, na.rm = TRUE),
+          sd = ~ sd(.x, na.rm = TRUE)
+        )
+      )
+    ) %>%
+    pivot_longer(
+      cols = everything(),
+      names_to = c("miRNA", ".value"),
+      names_sep = "_"
+    ) %>%
+    rename(
+      mean_control = mean,
+      sd_control = sd
+    )
+
+  p_values <- bind_rows(lapply(miRNA_cols, function(miRNA_name) {
+    data.frame(
+      miRNA = miRNA_name,
+      p_value = tryCatch(
+        t.test(train_fold_dat[[miRNA_name]] ~ train_fold_dat$CC)$p.value,
+        error = function(e) NA_real_
+      ),
+      stringsAsFactors = FALSE
+    )
+  }))
+
+  class_stats <- case_stats %>%
+    left_join(control_stats, by = "miRNA") %>%
+    left_join(p_values, by = "miRNA") %>%
+    mutate(
+      mean_diff = .data$mean_case - .data$mean_control,
+      class_snr = if_else(
+        (.data$sd_case + .data$sd_control) > 0,
+        abs(.data$mean_diff) / (.data$sd_case + .data$sd_control),
+        NA_real_
+      )
+    ) %>%
+    filter(is.finite(.data$class_snr), is.finite(.data$p_value)) %>%
+    select(
+      tidyselect::all_of(c(
+        "miRNA",
+        "mean_control",
+        "mean_case",
+        "mean_diff",
+        "sd_control",
+        "sd_case",
+        "class_snr",
+        "p_value"
+      ))
+    ) %>%
+    arrange(desc(.data$class_snr), .data$p_value)
+
+  selected <- class_stats %>%
+    slice_head(n = top_n) %>%
+    pull("miRNA")
+
+  list(
+    stats = class_stats,
+    selected = selected
+  )
+}
+
+```
+
+```{r, include=FALSE}
+prepare_fold_inputs <- function(train_fold_dat, valid_fold_dat, selected_miRNA) {
+  train_fold_dat <- train_fold_dat %>%
+    mutate(CC_bin = if_else(.data$CC == "PDAC case", 1, 0))
+  valid_fold_dat <- valid_fold_dat %>%
+    mutate(CC_bin = if_else(.data$CC == "PDAC case", 1, 0))
+
+  if (!length(selected_miRNA)) {
+    stop("Feature filtering returned zero miRNAs.", call. = TRUE)
+  }
+
+  complete_feature_flags <- bind_rows(
+    train_fold_dat %>%
+      summarise(
+        across(
+          tidyselect::all_of(selected_miRNA),
+          ~ all(!is.na(.x))
+        )
+      ) %>%
+      mutate(dataset = "train"),
+    valid_fold_dat %>%
+      summarise(
+        across(
+          tidyselect::all_of(selected_miRNA),
+          ~ all(!is.na(.x))
+        )
+      ) %>%
+      mutate(dataset = "valid")
+  )
+
+  selected_miRNA <- complete_feature_flags %>%
+    pivot_longer(
+      cols = tidyselect::all_of(selected_miRNA),
+      names_to = "miRNA",
+      values_to = "is_complete"
+    ) %>%
+    group_by(.data$miRNA) %>%
+    summarise(is_complete = all(.data$is_complete), .groups = "drop") %>%
+    filter(.data$is_complete) %>%
+    pull("miRNA")
+
+  if (!length(selected_miRNA)) {
+    stop("All selected miRNAs were removed after screening for complete data in both training and evaluation sets.", call. = TRUE)
+  }
+
+  keep_cols <- c("CC", "CC_bin", selected_miRNA)
+  train_model_dat <- train_fold_dat %>%
+    select(tidyselect::all_of(keep_cols))
+  valid_model_dat <- valid_fold_dat %>%
+    select(tidyselect::all_of(keep_cols))
+  model_formula <- stats::reformulate(selected_miRNA, response = "CC_bin")
+  class_formula <- stats::reformulate(selected_miRNA, response = "CC")
+
+  list(
+    selected_miRNA = selected_miRNA,
+    model_formula = model_formula,
+    class_formula = class_formula,
+    x_train = stats::model.matrix(model_formula, data = train_model_dat)[, -1, drop = FALSE],
+    x_valid = stats::model.matrix(model_formula, data = valid_model_dat)[, -1, drop = FALSE],
+    y_train = train_model_dat$CC_bin,
+    train_model_dat = train_model_dat,
+    valid_model_dat = valid_model_dat
+  )
+}
+```
+
+```{r}
 
 cv_set_ids <- unique(train_set$matched_set)
 k <- 5
@@ -578,7 +568,7 @@ cv_summary <- bind_rows(lapply(model_names, function(model_name) {
   )
 }))
 
-print(cv_summary[order(-cv_summary$cv_auc), ])
+print(cv_summary %>% arrange(desc(cv_auc)))
 write.csv(cv_summary,
           "Tables/AUC and Accuracy Per Model.csv",
           row.names = FALSE)
@@ -586,7 +576,7 @@ write.csv(cv_summary,
 ```
 
 
-## Stable Features in CV Folds
+### Stable Features in CV Folds
 Summarize feature selection stability across folds for each model
 
 ```{r}
@@ -657,38 +647,46 @@ final_model_outputs <- list(
   )
 )
 
-holdout_summary <- bind_rows(lapply(model_names, function(model_name) {
-  model_out <- final_model_outputs[[model_name]]
-  holdout_class <- ifelse(model_out$prob > 0.5, 1, 0)
-  roc_obj_test <- roc(holdout$CC_bin, model_out$prob, quiet = TRUE)
-
+holdout_predictions <- bind_rows(lapply(model_names, function(model_name) {
   data.frame(
     model = model_name,
-    test_accuracy = mean(holdout_class == holdout$CC_bin),
-    test_auc = as.numeric(auc(roc_obj_test))
+    observed = holdout$CC_bin,
+    prob = as.numeric(final_model_outputs[[model_name]]$prob),
+    stringsAsFactors = FALSE
   )
-}))
+})) %>%
+  mutate(
+    predicted_class = if_else(.data$prob > 0.5, 1, 0)
+  )
 
-print(holdout_summary[order(-holdout_summary$test_auc), ])
+holdout_summary <- holdout_predictions %>%
+  group_by(.data$model) %>%
+  summarise(
+    test_accuracy = mean(.data$predicted_class == .data$observed),
+    test_auc = as.numeric(pROC::auc(pROC::roc(.data$observed, .data$prob, quiet = TRUE))),
+    .groups = "drop"
+  )
+
+print(holdout_summary %>% arrange(desc(.data$test_auc)))
 write.csv(holdout_summary,
           "Tables/Holdout Summary.csv",
           row.names = FALSE)
 
-lapply(final_model_outputs, function(x) {
-  list(
-    n_prob = length(x$prob),
-    n_selected = if (!is.null(x$selected_features)) length(x$selected_features) else NA,
-    tuning = x$tuning
-  )
-})
-
-holdout_feature_summary <- bind_rows(lapply(model_names, function(model_name) {
+final_model_diagnostics <- bind_rows(lapply(model_names, function(model_name) {
   model_out <- final_model_outputs[[model_name]]
-  data.frame(
-    model = model_name,
-    n_selected_features = if (!is.null(model_out$selected_features)) length(model_out$selected_features) else NA
-  )
+
+  model_out$tuning %>%
+    mutate(
+      n_prob = length(model_out$prob),
+      .before = 1
+    )
 }))
+
+print(final_model_diagnostics %>%
+  select(tidyselect::all_of(c("model", "n_prob", "n_selected_features"))))
+
+holdout_feature_summary <- final_model_diagnostics %>%
+  select(tidyselect::all_of(c("model", "n_selected_features")))
 
 print(holdout_feature_summary)
 
@@ -698,14 +696,16 @@ print(holdout_feature_summary)
 
 ```{r}
 
-run_feature_logistic <- function(
+interpretation_fn <- function(
   train_dat,
   selected_miRNA,
   model_formula = CC_bin ~ miRNA_value + Sex + Race + Age
 ) {
   if (!length(selected_miRNA)) {
-    stop("run_feature_logistic failed: no selected miRNAs were provided.", call. = FALSE)
+    stop("No selected miRNAs were provided.", call. = TRUE)
   }
+
+# we know that there are no missing demographic variables 
 
   metadata_train <- data.frame(
     ID = as.character(train_dat$ID),
@@ -721,7 +721,7 @@ run_feature_logistic <- function(
   metadata_train <- droplevels(metadata_train[complete_rows, , drop = FALSE])
 
   if (nrow(metadata_train) == 0) {
-    stop("run_feature_logistic failed: no complete cases remained after screening the interpretation dataset metadata.", call. = FALSE)
+    stop("No complete cases remained after screening the interpretation dataset metadata.", call. = TRUE)
   }
 
   feature_mat <- train_dat[complete_rows, selected_miRNA, drop = FALSE]
@@ -731,28 +731,19 @@ run_feature_logistic <- function(
   ]
 
   if (!length(selected_miRNA)) {
-    stop("run_feature_logistic failed: all selected miRNAs were removed after screening for complete data in the interpretation dataset.", call. = FALSE)
+    stop("All selected miRNAs were removed after screening for complete data in the interpretation dataset.", call. = TRUE)
   }
 
   result_rows <- lapply(selected_miRNA, function(miRNA_name) {
     fit_dat <- metadata_train
     fit_dat$miRNA_value <- feature_mat[[miRNA_name]]
 
-    glm_fit <- try(
-      suppressWarnings(
-        stats::glm(model_formula, data = fit_dat, family = stats::binomial())
-      ),
-      silent = TRUE
-    )
-
-    if (inherits(glm_fit, "try-error")) {
-      stop(sprintf("run_feature_logistic failed: logistic regression did not converge for %s.", miRNA_name), call. = FALSE)
-    }
+    glm_fit <- stats::glm(model_formula, data = fit_dat, family = stats::binomial())
 
     coef_table <- summary(glm_fit)$coefficients
 
     if (!("miRNA_value" %in% rownames(coef_table))) {
-      stop(sprintf("run_feature_logistic failed: fitted model for %s did not return a miRNA_value coefficient.", miRNA_name), call. = FALSE)
+      stop(sprintf("Fitted model for %s did not return a miRNA_value coefficient.", miRNA_name), call. = TRUE)
     }
 
     estimate <- coef_table["miRNA_value", "Estimate"]
@@ -775,15 +766,12 @@ run_feature_logistic <- function(
   association_results <- association_results[stats::complete.cases(association_results$p_value), , drop = FALSE]
 
   if (nrow(association_results) == 0) {
-    stop("run_feature_logistic failed: no usable per-miRNA logistic regression results were produced.", call. = FALSE)
+    stop("No usable per-miRNA logistic regression results were produced.", call. = TRUE)
   }
 
   association_results$adj_p_value <- stats::p.adjust(association_results$p_value, method = "BH")
-  association_results <- association_results[
-    order(association_results$adj_p_value, association_results$p_value),
-    ,
-    drop = FALSE
-  ]
+  association_results <- association_results %>%
+    arrange(desc(.data$adj_p_value), .data$p_value)
 
   list(
     results = association_results,
@@ -791,7 +779,6 @@ run_feature_logistic <- function(
   )
 }
 
-interpretation_fn <- run_feature_logistic
 final_filter_stats <- filter_out_final$stats
 association_out <- interpretation_fn(
   train_dat = train_set,
@@ -808,50 +795,43 @@ write.csv(association_results,
 
 ```
 
-# Calibration Curves and Additional Metrics
+## Calibration Curves and Additional Metrics
 Reliability diagrams (calibration curves) and Brier scores for each model on the holdout set
 
 ```{r}
 
-calibration_summary <- data.frame(
-  model = character(),
-  brier_score = numeric(),
-  stringsAsFactors = FALSE
-)
+calibration_summary <- holdout_predictions %>%
+  group_by(.data$model) %>%
+  summarise(
+    brier_score = mean((.data$prob - .data$observed)^2, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+calibration_plot_data <- holdout_predictions %>%
+  mutate(
+    prob_bin = cut(
+      .data$prob,
+      breaks = seq(0, 1, by = 0.1),
+      include.lowest = TRUE,
+      right = TRUE
+    )
+  ) %>%
+  group_by(.data$model, .data$prob_bin) %>%
+  summarise(
+    mean_prob = mean(.data$prob, na.rm = TRUE),
+    observed_rate = mean(.data$observed, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  ) %>%
+  filter(!is.na(.data$mean_prob), !is.na(.data$observed_rate))
 
 for (model_name in model_names) {
-  model_out <- final_model_outputs[[model_name]]
-  calibration_raw <- data.frame(
-    observed = holdout$CC_bin,
-    prob = as.numeric(model_out$prob)
-  )
+  calibration_data <- calibration_plot_data %>%
+    filter(.data$model == model_name)
+  brier_score <- calibration_summary %>%
+    filter(.data$model == model_name) %>%
+    pull("brier_score")
 
-  brier_score <- mean((calibration_raw$prob - calibration_raw$observed)^2, na.rm = TRUE)
-  calibration_summary <- bind_rows(
-  calibration_summary,
-  data.frame(
-    model = model_name,
-    brier_score = brier_score
-  )
-)
-  # Bin probabilities for reliability curve
-  calibration_data <- calibration_raw %>%
-    mutate(
-      prob_bin = cut(
-        prob,
-        breaks = seq(0, 1, by = 0.1),
-        include.lowest = TRUE,
-        right = TRUE
-      )
-    ) %>%
-    group_by(prob_bin) %>%
-    summarise(
-      mean_prob = mean(prob, na.rm = TRUE),
-      observed_rate = mean(observed, na.rm = TRUE),
-      n = n(),
-      .groups = "drop"
-    ) %>%
-    filter(!is.na(mean_prob), !is.na(observed_rate))
   # Save calibration plot
   png(
     paste0("calibration_curve_", model_name, ".png"),
@@ -873,12 +853,12 @@ for (model_name in model_names) {
       ) +
       theme_minimal()
   )
-  invisible(dev.off())
+  dev.off()
 }
 
 # Show Brier scores for all models
 calibration_summary <- calibration_summary %>%
-  arrange(brier_score)
+  arrange(.data$brier_score)
 print(calibration_summary)
 
 write.csv(calibration_summary, "Tables/Calibration Summary.csv", row.names = FALSE)
@@ -892,7 +872,7 @@ ROC curve comparison of all models on the test set.
 ```{r}
 
 # ROC curve plot with all six models on the holdout set
-print(holdout_summary[order(-holdout_summary$test_auc), ])
+print(holdout_summary %>% arrange(desc(.data$test_auc)))
 
 roc_curves <- lapply(model_names, function(model_name) {
   roc(holdout$CC_bin, final_model_outputs[[model_name]]$prob, quiet = TRUE)
@@ -927,8 +907,8 @@ roc_curve_plot <- ggplot(
   coord_equal(xlim = c(0, 1), ylim = c(0, 1)) +
   labs(
     title = "ROC Curve Comparison of All Models",
-    x = "False Positive Rate",
-    y = "True Positive Rate",
+    x = "FP Rate",
+    y = "TP Rate",
     color = "Model"
   ) +
   theme_minimal()
@@ -936,7 +916,7 @@ roc_curve_plot <- ggplot(
 print(roc_curve_plot)
 png("roc_curve_comparison.png", width = 7 * 72, height = 5 * 72)
 print(roc_curve_plot)
-invisible(dev.off())
+dev.off()
 
 
 ```
@@ -947,48 +927,40 @@ invisible(dev.off())
 
 # final feature counts across all models:
 # create a table of all miRNA features selected by any final model, with a count of how many models selected each feature, sorted by count and then alphabetically
-final_model_feature_counts <- data.frame(
-  miRNA = miRNA_cols,
-  n_models_selected = integer(length(miRNA_cols)),
-  row.names = NULL
-)
-
-for (model_name in model_names) {
+final_selected_features <- bind_rows(lapply(model_names, function(model_name) {
   model_selected <- final_model_outputs[[model_name]]$selected_features
 
-  if (!is.null(model_selected) && length(model_selected) > 0) {
-    final_model_feature_counts$n_models_selected[
-      final_model_feature_counts$miRNA %in% model_selected
-    ] <- final_model_feature_counts$n_models_selected[
-      final_model_feature_counts$miRNA %in% model_selected
-    ] + 1L
+  if (is.null(model_selected) || !length(model_selected)) {
+    return(data.frame(
+      model = character(0),
+      miRNA = character(0),
+      stringsAsFactors = FALSE
+    ))
   }
-}
 
-final_model_feature_counts <- final_model_feature_counts[
-  final_model_feature_counts$n_models_selected > 0,
-  ,
-  drop = FALSE
-]
-final_model_feature_counts <- final_model_feature_counts[
-  order(-final_model_feature_counts$n_models_selected, final_model_feature_counts$miRNA),
-  ,
-  drop = FALSE
-]
+  data.frame(
+    model = rep(model_name, length(model_selected)),
+    miRNA = model_selected,
+    stringsAsFactors = FALSE
+  )
+}))
+
+final_model_feature_counts <- final_selected_features %>%
+  distinct(model, miRNA) %>%
+  count(miRNA, name = "n_models_selected") %>%
+  arrange(desc(n_models_selected), miRNA)
 
 print(final_model_feature_counts)
 write.csv(final_model_feature_counts, "Tables/Final Model Feature Counts.csv", row.names = FALSE)
 
 if (nrow(final_model_feature_counts) == 0) {
-  stop("final consensus feature selection failed: no miRNAs were selected by any final model.", call. = FALSE)
+  stop("No miRNAs were selected by any final model.", call. = TRUE)
 }
 
-top_rank_count <- max(final_model_feature_counts$n_models_selected)
-top_ranked_miRNA <- final_model_feature_counts[
-  final_model_feature_counts$n_models_selected == top_rank_count,
-  ,
-  drop = FALSE
-]
+top_ranked_miRNA <- final_model_feature_counts %>%
+  slice_max(order_by = n_models_selected, n = 1, with_ties = TRUE) %>%
+  arrange(miRNA)
+top_rank_count <- top_ranked_miRNA$n_models_selected[[1]]
 
 cat("Top-rank selection count:", top_rank_count, "of", length(model_names), "models\n")
 cat("Top-ranked miRNAs:", paste(top_ranked_miRNA$miRNA, collapse = ", "), "\n")
@@ -1023,7 +995,6 @@ write.csv(final_feature_table, "Tables/Final Consensus Features.csv", row.names 
 
 ```
 
-
 ## Association Plot of Final Consensus Features
 Logistic-regression association plot of final consensus features, colored by class SNR
 ```{r}
@@ -1034,6 +1005,6 @@ ggplot(final_feature_table, aes(x = estimate, y = -log10(adj_p_value), color = c
   scale_color_gradient(low = "blue", high = "red", na.value = "grey") +
   labs(title = "Association Plot of Final Consensus Features", x = "Log-Odds Coefficient", y = "-Log10 Adjusted P-Value", color = "Class SNR") +
   theme_minimal()
-invisible(dev.off())
+dev.off()
 
 ```
