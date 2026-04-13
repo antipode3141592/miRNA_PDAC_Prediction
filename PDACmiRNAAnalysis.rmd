@@ -20,6 +20,13 @@ library(dplyr)
 library(rpart)
 library(randomForest)
 
+source("R/run_fold_lasso.R")
+source("R/run_fold_enet.R")
+source("R/run_fold_forward_step.R")
+source("R/run_fold_lda.R")
+source("R/run_fold_rf.R")
+source("R/run_fold_dt.R")
+
 render_html_table <- function(data, caption = NULL, digits = NULL) {
   kable_args <- list(
     x = data,
@@ -70,7 +77,7 @@ association_cols <- c("miRNA", "estimate", "odds_ratio", "std_error", "z_value",
 # Preparing Data
 
 ## Import Data
-We use the normalized miRNA count matrix from GEO and merge it with the demographic metadata.
+We use the normalized miRNA count matrix from GEO and merge it with the demographic metadata.  Categorical variables are set to factors and the PDAC case and control variable is set to binary for modeling.
 
 ```{r, include=FALSE}
 
@@ -102,7 +109,7 @@ cat("Number of miRNA columns:", length(miRNA_cols), "\n")
 ```
 
 ## Create Training and Holdout Sets
-To properly split the data while respecting the matched-pairs, we will perform a training/holdout split at the level of matched sets, ensuring that all samples from a given matched set are either in the training set or holdout set, but not both.
+To split the data while respecting matched-pairs, we performed the split on the matched set IDs, ensuring each pair is not split between sets.
 
 ```{r, echo=FALSE, results='asis'}
 
@@ -147,201 +154,6 @@ Within each fold:
 2. We then fit each model using only the selected miRNAs from the normalized count matrix.
 
 The SNR filtering is calculated as the absolute difference in means between cases and controls divided by the sum of standard deviations, with an additional t-test for association. The top N miRNAs are selected based on the highest SNR values, with ties broken by p-value.
-
-```{r, include=FALSE}
-
-# Model Runners
-run_fold_forward_step <- function(fold_inputs, max_steps = 10) {
-  null_glm <- glm(CC_bin ~ 1, data = fold_inputs$train_model_dat, family = binomial())
-  full_glm <- glm(fold_inputs$model_formula, data = fold_inputs$train_model_dat, family = binomial())
-
-  forward_glm <- step(
-    object = null_glm,
-    scope = list(lower = formula(null_glm), upper = formula(full_glm)),
-    direction = "forward",
-    trace = 0,
-    steps = min(max_steps, length(fold_inputs$selected_miRNA))
-  )
-
-  prob <- as.numeric(
-    predict(forward_glm, newdata = fold_inputs$valid_model_dat, type = "response")
-  )
-
-  selected_features <- attr(terms(forward_glm), "term.labels")
-
-  list(
-    prob = prob,
-    selected_features = selected_features,
-    tuning = data.frame(
-      model = "forward_step",
-      n_selected_features = length(selected_features),
-      n_terms = length(selected_features),
-      stringsAsFactors = FALSE
-    )
-  )
-}
-
-run_fold_lasso <- function(fold_inputs, alpha_lasso = 1) {
-  cv.lasso <- glmnet::cv.glmnet(
-    fold_inputs$x_train,
-    fold_inputs$y_train,
-    alpha = alpha_lasso,
-    family = "binomial"
-  )
-
-  bestlam_lasso <- cv.lasso$lambda.min
-  prob <- as.numeric(
-    predict(cv.lasso, s = bestlam_lasso, newx = fold_inputs$x_valid, type = "response")
-  )
-
-  coef_mat_lasso <- as.matrix(
-    predict(cv.lasso, type = "coefficients", s = bestlam_lasso)
-  )
-
-  selected_features <- rownames(coef_mat_lasso)[coef_mat_lasso[, 1] != 0]
-  selected_features <- setdiff(selected_features, "(Intercept)")
-
-  list(
-    prob = prob,
-    selected_features = selected_features,
-    tuning = data.frame(
-      model = "lasso",
-      n_selected_features = length(selected_features),
-      alpha = alpha_lasso,
-      lambda = bestlam_lasso,
-      stringsAsFactors = FALSE
-    )
-  )
-}
-
-run_fold_enet <- function(
-  fold_inputs,
-  alpha_enet = c(0.1, 0.3, 0.5, 0.7, 0.9)
-) {
-  alpha_grid <- sort(unique(alpha_enet))
-  cv_fits <- lapply(alpha_grid, function(alpha_value) {
-    glmnet::cv.glmnet(
-      fold_inputs$x_train,
-      fold_inputs$y_train,
-      alpha = alpha_value,
-      family = "binomial"
-    )
-  })
-  cv_scores <- vapply(cv_fits, function(cv_fit) min(cv_fit$cvm), numeric(1))
-  best_index <- which.min(cv_scores)
-
-  cv.enet <- cv_fits[[best_index]]
-  best_alpha_enet <- alpha_grid[[best_index]]
-  bestlam_enet <- cv.enet$lambda.min
-  prob <- as.numeric(
-    predict(cv.enet, s = bestlam_enet, newx = fold_inputs$x_valid, type = "response")
-  )
-
-  coef_mat_enet <- as.matrix(
-    predict(cv.enet, type = "coefficients", s = bestlam_enet)
-  )
-
-  selected_features <- rownames(coef_mat_enet)[coef_mat_enet[, 1] != 0]
-  selected_features <- setdiff(selected_features, "(Intercept)")
-
-  list(
-    prob = prob,
-    selected_features = selected_features,
-    tuning = data.frame(
-      model = "enet",
-      n_selected_features = length(selected_features),
-      alpha = best_alpha_enet,
-      lambda = bestlam_enet,
-      cv_score = cv_scores[[best_index]],
-      alpha_grid = paste(alpha_grid, collapse = ","),
-      stringsAsFactors = FALSE
-    )
-  )
-}
-
-run_fold_lda <- function(
-  fold_inputs,
-  max_features = 20,
-  prior = c(0.5, 0.5)
-) {
-  selected_miRNA <- head(fold_inputs$selected_miRNA, max_features)
-  class_formula <- stats::reformulate(selected_miRNA, response = "CC")
-  train_model_dat <- fold_inputs$train_model_dat[, c("CC", "CC_bin", selected_miRNA), drop = FALSE]
-  valid_model_dat <- fold_inputs$valid_model_dat[, c("CC", "CC_bin", selected_miRNA), drop = FALSE]
-
-  lda_fit <- MASS::lda(
-    class_formula,
-    data = train_model_dat,
-    prior = prior
-  )
-  lda_pred <- predict(lda_fit, newdata = valid_model_dat)
-  prob <- as.numeric(lda_pred$posterior[, "PDAC case"])
-
-  list(
-    prob = prob,
-    selected_features = selected_miRNA,
-    tuning = data.frame(
-      model = "lda",
-      n_selected_features = length(selected_miRNA),
-      n_features = length(selected_miRNA),
-      prior = paste(prior, collapse = ","),
-      stringsAsFactors = FALSE
-    )
-  )
-}
-
-run_fold_rf <- function(fold_inputs, ntree = 500) {
-  rf_fit <- randomForest::randomForest(
-    fold_inputs$class_formula,
-    data = fold_inputs$train_model_dat,
-    ntree = ntree
-  )
-
-  prob <- as.numeric(
-    predict(rf_fit, newdata = fold_inputs$valid_model_dat, type = "prob")[, "PDAC case"]
-  )
-
-  list(
-    prob = prob,
-    selected_features = fold_inputs$selected_miRNA,
-    tuning = data.frame(
-      model = "random_forest",
-      n_selected_features = length(fold_inputs$selected_miRNA),
-      ntree = ntree,
-      stringsAsFactors = FALSE
-    )
-  )
-}
-
-run_fold_dt <- function(fold_inputs, cp_dt = 0.01, maxdepth = 10) {
-  dt_fit <- rpart::rpart(
-    fold_inputs$class_formula,
-    data = fold_inputs$train_model_dat,
-    method = "class",
-    control = rpart::rpart.control(cp = cp_dt, maxdepth = maxdepth)
-  )
-
-  prob <- as.numeric(
-    predict(dt_fit, newdata = fold_inputs$valid_model_dat, type = "prob")[, "PDAC case"]
-  )
-
-  selected_features <- attr(terms(dt_fit), "term.labels")
-
-  list(
-    prob = prob,
-    selected_features = selected_features,
-    tuning = data.frame(
-      model = "decision_tree",
-      n_selected_features = length(selected_features),
-      cp = cp_dt,
-      maxdepth = maxdepth,
-      n_terms = length(selected_features),
-      stringsAsFactors = FALSE
-    )
-  )
-}
-
-```
 ```{r, include=FALSE}
 
 # Feature filter
@@ -482,6 +294,8 @@ prepare_fold_inputs <- function(train_fold_dat, valid_fold_dat, selected_miRNA) 
   if (!length(selected_miRNA)) {
     stop("All selected miRNAs were removed after screening for complete data in both training and evaluation sets.", call. = TRUE)
   }
+
+#TODO:  add demographic variables to the model and the variable 
 
   keep_cols <- c("CC", "CC_bin", selected_miRNA)
   train_model_dat <- train_fold_dat %>%

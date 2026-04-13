@@ -10,7 +10,7 @@
 
 
 
-<meta name="date" content="2026-04-07" />
+<meta name="date" content="2026-04-13" />
 
 <title>Final Project - Predicting PDAC with Circulating miRNA</title>
 
@@ -351,7 +351,7 @@ display: none;
 
 <h1 class="title toc-ignore">Final Project - Predicting PDAC with
 Circulating miRNA</h1>
-<h4 class="date">2026-04-07</h4>
+<h4 class="date">2026-04-13</h4>
 
 </div>
 
@@ -361,14 +361,14 @@ Circulating miRNA</h1>
 <div id="import-data" class="section level2">
 <h2>Import Data</h2>
 <p>We use the normalized miRNA count matrix from GEO and merge it with
-the demographic metadata.</p>
+the demographic metadata. Categorical variables are set to factors and
+the PDAC case and control variable is set to binary for modeling.</p>
 </div>
 <div id="create-training-and-holdout-sets" class="section level2">
 <h2>Create Training and Holdout Sets</h2>
-<p>To properly split the data while respecting the matched-pairs, we
-will perform a training/holdout split at the level of matched sets,
-ensuring that all samples from a given matched set are either in the
-training set or holdout set, but not both.</p>
+<p>To split the data while respecting matched-pairs, we performed the
+split on the matched set IDs, ensuring each pair is not split between
+sets.</p>
 <table>
 <caption>
 Training and holdout set sizes
