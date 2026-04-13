@@ -1,14 +1,22 @@
 ---
 title: "Final Project - Predicting PDAC with Circulating miRNA"
+authors: "Madison Blake, Kristyn Gumpper-Fedus, Sean Kirkpatrick"
 date: "`r Sys.Date()`"
 output: html_document
 ---
 
 ```{r setup, include=FALSE}
 
-knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(
+  echo = TRUE,
+  dev = "png",
+  fig.path = "Figures/",
+  fig.retina = 1
+)
 
 setwd("~/Classes/BMI7235 - Machine Learning/Final Project")
+
+dir.create("Figures", showWarnings = FALSE, recursive = TRUE)
 
 library(readxl)
 library(readr)
@@ -20,34 +28,13 @@ library(dplyr)
 library(rpart)
 library(randomForest)
 
+source("R/plotHelpers.R")
 source("R/run_fold_lasso.R")
 source("R/run_fold_enet.R")
 source("R/run_fold_forward_step.R")
 source("R/run_fold_lda.R")
 source("R/run_fold_rf.R")
 source("R/run_fold_dt.R")
-
-render_html_table <- function(data, caption = NULL, digits = NULL) {
-  kable_args <- list(
-    x = data,
-    format = "html",
-    row.names = FALSE,
-    caption = caption
-  )
-
-  if (!is.null(digits)) {
-    kable_args$digits <- digits
-  }
-
-  cat(
-    do.call(knitr::kable, kable_args),
-    sep = "\n"
-  )
-}
-
-model_display_name <- function(model_name) {
-  tools::toTitleCase(gsub("_", " ", model_name))
-}
 
 ```
 
@@ -742,7 +729,7 @@ calibration_plot_data <- holdout_predictions %>%
   ) %>%
   filter(!is.na(.data$mean_prob), !is.na(.data$observed_rate))
 
-calibration_plots <- list()
+calibration_plot_files <- list()
 
 for (model_name in model_names) {
   calibration_data <- calibration_plot_data %>%
@@ -765,15 +752,12 @@ for (model_name in model_names) {
     ) +
     theme_minimal()
 
-  calibration_plots[[model_name]] <- calibration_plot
+  calibration_plot_file <- file.path("Figures", paste0("calibration_curve_", model_name, ".png"))
+  calibration_plot_files[[model_name]] <- calibration_plot_file
 
-  ggsave(
-    filename = paste0("calibration_curve_", model_name, ".png"),
+  save_plot(
+    filename = calibration_plot_file,
     plot = calibration_plot,
-    width = 7,
-    height = 5,
-    units = "in",
-    dpi = 72
   )
 }
 
@@ -790,7 +774,13 @@ render_html_table(
 
 for (model_name in model_names) {
   cat("### ", model_display_name(model_name), "\n\n", sep = "")
-  print(calibration_plots[[model_name]])
+  cat(
+    sprintf(
+      '<img src="%s" alt="Calibration Curve - %s" style="width:100%%; max-width:700px;" />\n\n',
+      calibration_plot_files[[model_name]],
+      model_name
+    )
+  )
 }
 
 ```
@@ -847,16 +837,19 @@ roc_curve_plot <- ggplot(
   ) +
   theme_minimal()
 
-ggsave(
-  filename = "roc_curve_comparison.png",
+roc_curve_plot_file <- file.path("Figures", "roc_curve_comparison.png")
+
+save_plot(
+  filename = roc_curve_plot_file,
   plot = roc_curve_plot,
-  width = 7,
-  height = 5,
-  units = "in",
-  dpi = 72
 )
 
-print(roc_curve_plot)
+cat(
+  sprintf(
+    '<img src="%s" alt="ROC Curve Comparison of All Models" style="width:100%%; max-width:700px;" />\n\n',
+    roc_curve_plot_file
+  )
+)
 
 
 ```
@@ -955,7 +948,7 @@ render_html_table(
 
 ## Association Plot of Final Consensus Features
 Logistic-regression association plot of final consensus features, colored by class SNR
-```{r, echo=FALSE, fig.width=7, fig.height=5}
+```{r, echo=FALSE, results='asis', fig.width=7, fig.height=5}
 
 association_plot <- ggplot(
   final_feature_table,
@@ -971,15 +964,18 @@ association_plot <- ggplot(
   ) +
   theme_minimal()
 
-print(association_plot)
+association_plot_file <- "Figures/Association Plot Final Features.png"
 
-ggsave(
-  filename = "Figures/Association Plot Final Features.png",
+save_plot(
+  filename = association_plot_file,
   plot = association_plot,
-  width = 7,
-  height = 5,
-  units = "in",
-  dpi = 72
+)
+
+cat(
+  sprintf(
+    '<img src="%s" alt="Association Plot of Final Consensus Features" style="width:100%%; max-width:700px;" />\n\n',
+    association_plot_file
+  )
 )
 
 ```
