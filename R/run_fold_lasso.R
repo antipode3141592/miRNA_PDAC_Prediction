@@ -3,7 +3,8 @@ run_fold_lasso <- function(fold_inputs, alpha_lasso = 1) {
     fold_inputs$x_train,
     fold_inputs$y_train,
     alpha = alpha_lasso,
-    family = "binomial"
+    family = "binomial",
+    penalty.factor = fold_inputs$penalty_factor
   )
 
   bestlam_lasso <- cv.lasso$lambda.min
@@ -17,6 +18,7 @@ run_fold_lasso <- function(fold_inputs, alpha_lasso = 1) {
 
   selected_features <- rownames(coef_mat_lasso)[coef_mat_lasso[, 1] != 0]
   selected_features <- setdiff(selected_features, "(Intercept)")
+  selected_features <- selected_features[selected_features %in% fold_inputs$selected_miRNA]
 
   list(
     prob = prob,

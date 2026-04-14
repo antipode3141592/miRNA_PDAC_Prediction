@@ -8,7 +8,8 @@ run_fold_enet <- function(
       fold_inputs$x_train,
       fold_inputs$y_train,
       alpha = alpha_value,
-      family = "binomial"
+      family = "binomial",
+      penalty.factor = fold_inputs$penalty_factor
     )
   })
   cv_scores <- vapply(cv_fits, function(cv_fit) min(cv_fit$cvm), numeric(1))
@@ -27,6 +28,7 @@ run_fold_enet <- function(
 
   selected_features <- rownames(coef_mat_enet)[coef_mat_enet[, 1] != 0]
   selected_features <- setdiff(selected_features, "(Intercept)")
+  selected_features <- selected_features[selected_features %in% fold_inputs$selected_miRNA]
 
   list(
     prob = prob,

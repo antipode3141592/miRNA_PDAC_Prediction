@@ -4,9 +4,10 @@ run_fold_lda <- function(
   prior = c(0.5, 0.5)
 ) {
   selected_miRNA <- head(fold_inputs$selected_miRNA, max_features)
-  class_formula <- stats::reformulate(selected_miRNA, response = "CC")
-  train_model_dat <- fold_inputs$train_model_dat[, c("CC", "CC_bin", selected_miRNA), drop = FALSE]
-  valid_model_dat <- fold_inputs$valid_model_dat[, c("CC", "CC_bin", selected_miRNA), drop = FALSE]
+  predictor_cols <- c(fold_inputs$base_feature_cols, selected_miRNA)
+  class_formula <- stats::reformulate(predictor_cols, response = "CC")
+  train_model_dat <- fold_inputs$train_design_dat[, c("CC", "CC_bin", predictor_cols), drop = FALSE]
+  valid_model_dat <- fold_inputs$valid_design_dat[, c("CC", "CC_bin", predictor_cols), drop = FALSE]
 
   lda_fit <- MASS::lda(
     class_formula,

@@ -20,7 +20,7 @@ model_display_name <- function(model_name) {
   tools::toTitleCase(gsub("_", " ", model_name))
 }
 
-save_plot <- function (filename, plot, width = 7, height = 5, units = "in", dpi = 72) {
+save_plot <- function (filename, plot, width = 7, height = 5, units = "in", dpi = 144) {
   ggplot2::ggsave(
     filename = filename,
     plot = plot,

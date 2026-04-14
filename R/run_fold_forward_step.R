@@ -1,6 +1,16 @@
 run_fold_forward_step <- function(fold_inputs, max_steps = 10) {
-  null_glm <- glm(CC_bin ~ 1, data = fold_inputs$train_model_dat, family = binomial())
-  full_glm <- glm(fold_inputs$model_formula, data = fold_inputs$train_model_dat, family = binomial())
+  null_glm <- glm(
+    fold_inputs$base_model_formula,
+    data = fold_inputs$train_design_dat,
+    family = binomial(),
+    na.action = stats::na.fail
+  )
+  full_glm <- glm(
+    fold_inputs$model_formula,
+    data = fold_inputs$train_design_dat,
+    family = binomial(),
+    na.action = stats::na.fail
+  )
 
   forward_glm <- step(
     object = null_glm,
@@ -11,10 +21,11 @@ run_fold_forward_step <- function(fold_inputs, max_steps = 10) {
   )
 
   prob <- as.numeric(
-    predict(forward_glm, newdata = fold_inputs$valid_model_dat, type = "response")
+    predict(forward_glm, newdata = fold_inputs$valid_design_dat, type = "response")
   )
 
   selected_features <- attr(terms(forward_glm), "term.labels")
+  selected_features <- selected_features[selected_features %in% fold_inputs$selected_miRNA]
 
   list(
     prob = prob,
