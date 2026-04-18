@@ -26,16 +26,17 @@ run_fold_enet <- function(
     predict(cv.enet, type = "coefficients", s = bestlam_enet)
   )
 
-  selected_features <- rownames(coef_mat_enet)[coef_mat_enet[, 1] != 0]
-  selected_features <- setdiff(selected_features, "(Intercept)")
-  selected_features <- selected_features[selected_features %in% fold_inputs$selected_miRNA]
+  selected_variables <- rownames(coef_mat_enet)[coef_mat_enet[, 1] != 0]
+  selected_variables <- setdiff(selected_variables, "(Intercept)")
+  selected_miRNA <- selected_variables[selected_variables %in% fold_inputs$selected_miRNA]
 
   list(
     prob = prob,
-    selected_features = selected_features,
+    selected_variables = selected_variables,
+    selected_miRNA = selected_miRNA,
     tuning = data.frame(
       model = "enet",
-      n_selected_features = length(selected_features),
+      n_selected_miRNA = length(selected_miRNA),
       alpha = best_alpha_enet,
       lambda = bestlam_enet,
       cv_score = cv_scores[[best_index]],

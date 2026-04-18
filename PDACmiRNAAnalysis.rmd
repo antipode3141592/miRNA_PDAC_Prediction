@@ -92,6 +92,7 @@ dt_maxdepth <- 7
 
 fold_filter_name <- "blocked limma"
 fold_filter_top_n <- 20
+final_variable_heatmap_max_n <- fold_filter_top_n
 demographic_covariates <- c("Sex", "Race", "Age")
 factor_demographic_covariates <- c("Sex", "Race")
 use_model_covariates <- TRUE
@@ -134,7 +135,7 @@ write_comma_separated_list <- function(items) {
 
 ##### DEVELOPMENT #####
 developmentMode <- TRUE
-development_use_model_covariates <- FALSE
+development_use_model_covariates <- TRUE
 
 
 # models to exclude
@@ -426,6 +427,22 @@ build_penalty_factor <- function(column_names, protected_terms) {
   penalty_factor
 }
 
+is_model_covariate_term <- function(variable_names, covariate_names = model_covariates) {
+  if (!length(variable_names)) {
+    return(logical(0))
+  }
+
+  if (!length(covariate_names)) {
+    return(rep(FALSE, length(variable_names)))
+  }
+
+  vapply(
+    variable_names,
+    function(variable_name) any(startsWith(variable_name, covariate_names)),
+    logical(1)
+  )
+}
+
 prepare_fold_inputs <- function(train_fold_dat, valid_fold_dat, selected_miRNA) {
   train_fold_dat <- train_fold_dat %>%
     mutate(CC_bin = if_else(.data$CC == "PDAC case", 1, 0))
@@ -460,7 +477,11 @@ prepare_fold_inputs <- function(train_fold_dat, valid_fold_dat, selected_miRNA) 
   design_feature_cols <- colnames(x_train)
   base_feature_cols <- design_feature_cols[!(design_feature_cols %in% selected_miRNA)]
   model_formula <- stats::reformulate(design_feature_cols, response = "CC_bin")
-  base_model_formula <- stats::reformulate(base_feature_cols, response = "CC_bin")
+  base_model_formula <- if (length(base_feature_cols)) {
+    stats::reformulate(base_feature_cols, response = "CC_bin")
+  } else {
+    stats::as.formula("CC_bin ~ 1")
+  }
   class_formula <- stats::reformulate(design_feature_cols, response = "CC")
   train_design_dat <- data.frame(
     CC = train_model_dat$CC,
@@ -478,6 +499,7 @@ prepare_fold_inputs <- function(train_fold_dat, valid_fold_dat, selected_miRNA) 
   list(
     selected_miRNA = selected_miRNA,
     model_covariates = model_covariates,
+    design_feature_cols = design_feature_cols,
     base_feature_cols = base_feature_cols,
     base_model_formula = base_model_formula,
     model_formula = model_formula,
@@ -548,9 +570,9 @@ for (fold in 1:k) {
       fold = fold
     )
 
-    feature_tracker[[model_name]][[fold]] <- model_out$selected_features
+    feature_tracker[[model_name]][[fold]] <- model_out$selected_miRNA
     tuning_tracker[[model_name]][[fold]] <- model_out$tuning
-    feature_count_tracker[[model_name]][fold] <- length(model_out$selected_features)
+    feature_count_tracker[[model_name]][fold] <- length(model_out$selected_miRNA)
   }
 }
 
@@ -612,12 +634,12 @@ for (model_name in model_names) {
 
   fold_feature_counts <- data.frame(
     fold = seq_along(feature_count_tracker[[model_name]]),
-    n_selected_features = feature_count_tracker[[model_name]],
+    n_selected_miRNA = feature_count_tracker[[model_name]],
     row.names = NULL
   )
   render_html_table(
     fold_feature_counts,
-    caption = paste("Selected feature counts by fold for", display_name)
+    caption = paste("Selected miRNA counts by fold for", display_name)
   )
 
   tuning_summary <- bind_rows(tuning_tracker[[model_name]])
@@ -708,7 +730,7 @@ final_model_diagnostics <- bind_rows(lapply(model_names, function(model_name) {
 }))
 
 diagnostic_summary <- final_model_diagnostics %>%
-  dplyr::select(tidyselect::all_of(c("model", "n_prob", "n_selected_features")))
+  dplyr::select(tidyselect::all_of(c("model", "n_prob", "n_selected_miRNA")))
 
 render_html_table(
   diagnostic_summary,
@@ -716,11 +738,208 @@ render_html_table(
 )
 
 holdout_feature_summary <- final_model_diagnostics %>%
-  dplyr::select(tidyselect::all_of(c("model", "n_selected_features")))
+  dplyr::select(tidyselect::all_of(c("model", "n_selected_miRNA")))
 
 render_html_table(
   holdout_feature_summary,
-  caption = "Selected feature counts in final holdout models"
+  caption = "Selected miRNA counts in final holdout models"
+)
+
+final_model_variable_summary <- bind_rows(lapply(model_names, function(model_name) {
+  model_out <- final_model_outputs[[model_name]]
+  selected_variables <- unique(model_out$selected_variables)
+  selected_demographics <- selected_variables[is_model_covariate_term(selected_variables)]
+  selected_miRNA <- selected_variables[!is_model_covariate_term(selected_variables)]
+
+  data.frame(
+    model = model_display_name(model_name),
+    n_final_variables = length(selected_variables),
+    demographic_variables = if (length(selected_demographics)) {
+      write_comma_separated_list(selected_demographics)
+    } else {
+      "None"
+    },
+    miRNA_variables = if (length(selected_miRNA)) {
+      write_comma_separated_list(selected_miRNA)
+    } else {
+      "None"
+    },
+    final_variables = if (length(selected_variables)) {
+      write_comma_separated_list(selected_variables)
+    } else {
+      "None"
+    },
+    stringsAsFactors = FALSE
+  )
+}))
+
+write.csv(
+  final_model_variable_summary,
+  "Tables/Final Model Variables.csv",
+  row.names = FALSE
+)
+
+render_html_table(
+  final_model_variable_summary,
+  caption = "Final variables used by each holdout model"
+)
+
+final_model_variable_long <- bind_rows(lapply(model_names, function(model_name) {
+  selected_variables <- unique(final_model_outputs[[model_name]]$selected_variables)
+
+  if (!length(selected_variables)) {
+    return(data.frame(
+      model = character(0),
+      variable = character(0),
+      variable_type = character(0),
+      stringsAsFactors = FALSE
+    ))
+  }
+
+  data.frame(
+    model = model_display_name(model_name),
+    variable = selected_variables,
+    variable_type = ifelse(
+      is_model_covariate_term(selected_variables),
+      "Demographic",
+      "miRNA"
+    ),
+    stringsAsFactors = FALSE
+  )
+}))
+
+final_variable_presence <- final_model_variable_long %>%
+  distinct(model, variable, .keep_all = TRUE) %>%
+  mutate(selected = "Yes") %>%
+  tidyr::pivot_wider(
+    names_from = model,
+    values_from = selected,
+    values_fill = ""
+  ) %>%
+  left_join(
+    final_model_variable_long %>%
+      distinct(model, variable, .keep_all = TRUE) %>%
+      count(variable, variable_type, name = "n_models_selected"),
+    by = c("variable", "variable_type")
+  ) %>%
+  mutate(
+    variable_type_order = if_else(.data$variable_type == "Demographic", 0L, 1L)
+  ) %>%
+  arrange(.data$variable_type_order, desc(.data$n_models_selected), .data$variable) %>%
+  dplyr::select(-.data$variable_type_order)
+
+write.csv(
+  final_variable_presence,
+  "Tables/Final Variable Inclusion Matrix.csv",
+  row.names = FALSE
+)
+
+render_html_table(
+  final_variable_presence,
+  caption = "Final variable inclusion matrix across holdout models"
+)
+
+final_model_variable_heatmap_counts <- final_model_variable_long %>%
+  distinct(model, variable, .keep_all = TRUE) %>%
+  count(variable, variable_type, name = "n_models_selected") %>%
+  arrange(desc(n_models_selected), variable_type, variable)
+
+if (!is.null(final_variable_heatmap_max_n) &&
+    (!is.numeric(final_variable_heatmap_max_n) || length(final_variable_heatmap_max_n) != 1L || final_variable_heatmap_max_n < 1)) {
+  stop("final_variable_heatmap_max_n must be NULL or a single positive number.")
+}
+
+final_variable_heatmap_top_n <- if (is.null(final_variable_heatmap_max_n)) {
+  nrow(final_model_variable_heatmap_counts)
+} else {
+  min(as.integer(final_variable_heatmap_max_n), nrow(final_model_variable_heatmap_counts))
+}
+
+final_variable_heatmap_subtitle <- if (final_variable_heatmap_top_n < nrow(final_model_variable_heatmap_counts)) {
+  paste(
+    "Top",
+    final_variable_heatmap_top_n,
+    "variables ordered by number of final models selecting them"
+  )
+} else {
+  "All final variables ordered by number of final models selecting them"
+}
+
+final_model_display_names <- vapply(model_names, model_display_name, character(1))
+
+final_variable_heatmap_variables <- final_model_variable_heatmap_counts %>%
+  slice_head(n = final_variable_heatmap_top_n) %>%
+  mutate(
+    variable_label = paste0(.data$variable, " (", .data$n_models_selected, ")")
+  )
+
+final_variable_heatmap_selected <- final_model_variable_long %>%
+  distinct(model, variable) %>%
+  mutate(selected = "Selected")
+
+final_variable_heatmap_data <- tidyr::expand_grid(
+  model = final_model_display_names,
+  variable = final_variable_heatmap_variables$variable
+) %>%
+  left_join(
+    final_variable_heatmap_variables,
+    by = "variable"
+  ) %>%
+  left_join(
+    final_variable_heatmap_selected,
+    by = c("model", "variable")
+  ) %>%
+  mutate(
+    selected = if_else(is.na(.data$selected), "Not selected", .data$selected),
+    model = factor(.data$model, levels = final_model_display_names),
+    variable_type = factor(.data$variable_type, levels = c("Demographic", "miRNA")),
+    variable_label = factor(
+      .data$variable_label,
+      levels = rev(final_variable_heatmap_variables$variable_label)
+    )
+  )
+
+final_variable_heatmap <- ggplot(
+  final_variable_heatmap_data,
+  aes(x = model, y = variable_label, fill = selected)
+) +
+  geom_tile(color = "white", linewidth = 0.6) +
+  facet_grid(variable_type ~ ., scales = "free_y", space = "free_y") +
+  scale_fill_manual(
+    values = c(
+      "Not selected" = "#ece8df",
+      "Selected" = "#0f5c78"
+    )
+  ) +
+  labs(
+    title = "Final Variable Selection Heatmap",
+    subtitle = final_variable_heatmap_subtitle,
+    x = "Model",
+    y = "Variable (number of models selecting it)",
+    fill = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 35, hjust = 1),
+    strip.text.y = element_text(angle = 0),
+    legend.position = "top"
+  )
+
+final_variable_heatmap_file <- file.path("Figures", "final_variable_selection_heatmap.png")
+
+save_plot(
+  filename = final_variable_heatmap_file,
+  plot = final_variable_heatmap,
+  width = 8,
+  height = max(5, 0.3 * nrow(final_variable_heatmap_variables) + 1.5)
+)
+
+cat(
+  sprintf(
+    '<img src="%s" alt="Final Variable Selection Heatmap" style="width:100%%; max-width:900px;" />\n\n',
+    final_variable_heatmap_file
+  )
 )
 
 ```
@@ -882,12 +1101,14 @@ cat(
 
 # Selected miRNA Features and Interpretation
 
-```{r final_selected_features, echo=FALSE, results='asis'}
+## Final selected miRNA across all models
+
+```{r final_selected_miRNA, echo=FALSE, results='asis'}
 
 # final feature counts across all models:
 # create a table of all miRNA features selected by any final model, with a count of how many models selected each feature, sorted by count and then alphabetically
-final_selected_features <- bind_rows(lapply(model_names, function(model_name) {
-  model_selected <- final_model_outputs[[model_name]]$selected_features
+final_selected_miRNA <- bind_rows(lapply(model_names, function(model_name) {
+  model_selected <- final_model_outputs[[model_name]]$selected_miRNA
 
   if (is.null(model_selected) || !length(model_selected)) {
     return(data.frame(
@@ -904,7 +1125,7 @@ final_selected_features <- bind_rows(lapply(model_names, function(model_name) {
   )
 }))
 
-final_model_feature_counts <- final_selected_features %>%
+final_model_feature_counts <- final_selected_miRNA %>%
   distinct(model, miRNA) %>%
   count(miRNA, name = "n_models_selected") %>%
   arrange(desc(n_models_selected), miRNA)
@@ -990,6 +1211,136 @@ if (nrow(top_ranked_miRNA_details) > 1) {
       "so the table below is ordered by the smallest blocked-limma p-value, ",
       "with ties broken by the absolute moderated t-statistic and then miRNA identifier. ",
       "The first row is the top-ranked consensus miRNA used for downstream annotation.</p>\n"
+    )
+  )
+}
+
+```
+
+## Final selected variables across all models
+```{r final_selected_variables, echo=FALSE, results='asis'}
+
+# final feature counts across all models:
+# create a table of all features selected by any final model, with a count of how many models selected each feature, sorted by count and then alphabetically
+final_selected_variables <- bind_rows(lapply(model_names, function(model_name) {
+  model_selected <- final_model_outputs[[model_name]]$selected_variables
+
+  if (is.null(model_selected) || !length(model_selected)) {
+    return(data.frame(
+      model = character(0),
+      variable = character(0),
+      stringsAsFactors = FALSE
+    ))
+  }
+
+  data.frame(
+    model = rep(model_name, length(model_selected)),
+    variable = model_selected,
+    stringsAsFactors = FALSE
+  )
+}))
+
+final_model_variable_counts <- final_selected_variables %>%
+  distinct(model, variable) %>%
+  mutate(
+    variable_type = if_else(is_model_covariate_term(.data$variable), "Demographic", "miRNA")
+  ) %>%
+  count(variable, variable_type, name = "n_models_selected") %>%
+  arrange(desc(n_models_selected), variable_type, variable)
+
+write.csv(final_model_variable_counts, "Tables/Final Variable Counts.csv", row.names = FALSE)
+
+render_html_table(
+  final_model_variable_counts,
+  caption = "Counts of models selecting each variable"
+)
+
+if (nrow(final_model_variable_counts) == 0) {
+  stop("No variables were selected by any final model.", call. = TRUE)
+}
+
+final_filter_stats <- final_filter_results$stats
+
+gpl <- read_tsv(
+  gene_family_file,
+  col_names = c("Annotation", "Alias", "MIMAT", "ClassName"),
+  show_col_types = FALSE
+)
+
+annotation_lookup <- gpl %>%
+  distinct(.data$MIMAT, .keep_all = TRUE) %>%
+  transmute(
+    miRNA = .data$MIMAT,
+    Annotation = .data$Annotation
+  )
+
+top_ranked_variable <- final_model_variable_counts %>%
+  slice_max(order_by = n_models_selected, n = 1, with_ties = TRUE) %>%
+  arrange(variable_type, variable)
+top_rank_count <- top_ranked_variable$n_models_selected[[1]]
+
+top_ranked_variable_details <- top_ranked_variable %>%
+  mutate(
+    miRNA = if_else(.data$variable_type == "miRNA", .data$variable, NA_character_)
+  ) %>%
+  left_join(final_filter_stats[, filter_stat_cols], by = "miRNA") %>%
+  left_join(annotation_lookup, by = "miRNA") %>%
+  mutate(
+    Annotation = if_else(
+      .data$variable_type == "Demographic",
+      "Demographic covariate",
+      .data$Annotation
+    )
+  ) %>%
+  arrange(is.na(.data$limma_p_value), .data$limma_p_value, desc(abs(.data$limma_t)), .data$variable)
+
+top_ranked_variable_details$multiMiR_query_id <- vapply(
+  top_ranked_variable_details$Annotation,
+  FUN.VALUE = character(1),
+  function(annotation_value) {
+    if (is.na(annotation_value) || !nzchar(annotation_value)) {
+      return(NA_character_)
+    }
+
+    trimws(strsplit(annotation_value, ",", fixed = TRUE)[[1]][[1]])
+  }
+)
+
+top_ranked_consensus_variable <- top_ranked_variable_details %>%
+  slice_head(n = 1)
+
+cat(
+  "<p>Top-rank selection count: ",
+  top_rank_count,
+  " of ",
+  length(model_names),
+  " models</p>\n",
+  sep = ""
+)
+
+render_html_table(
+  top_ranked_variable_details %>%
+    dplyr::select(
+      variable,
+      variable_type,
+      Annotation,
+      n_models_selected,
+      limma_log_fc,
+      limma_t,
+      limma_p_value,
+      limma_adj_p_value
+    ),
+  caption = "Top-ranked consensus variables"
+)
+
+if (nrow(top_ranked_variable_details) > 1) {
+  cat(
+    paste0(
+      "<p>Multiple variables tied for the highest model-selection count, ",
+      "so miRNA variables in the table below are ordered by the smallest blocked-limma p-value, ",
+      "with ties broken by the absolute moderated t-statistic and then variable identifier. ",
+      "Demographic covariates do not have blocked-limma statistics and are listed after miRNA variables. ",
+      "The first row is the top-ranked consensus variable used for downstream annotation.</p>\n"
     )
   )
 }

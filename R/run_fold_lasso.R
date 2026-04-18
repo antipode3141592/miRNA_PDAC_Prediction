@@ -16,16 +16,17 @@ run_fold_lasso <- function(fold_inputs, alpha_lasso = 1) {
     predict(cv.lasso, type = "coefficients", s = bestlam_lasso)
   )
 
-  selected_features <- rownames(coef_mat_lasso)[coef_mat_lasso[, 1] != 0]
-  selected_features <- setdiff(selected_features, "(Intercept)")
-  selected_features <- selected_features[selected_features %in% fold_inputs$selected_miRNA]
+  selected_variables <- rownames(coef_mat_lasso)[coef_mat_lasso[, 1] != 0]
+  selected_variables <- setdiff(selected_variables, "(Intercept)")
+  selected_miRNA <- selected_variables[selected_variables %in% fold_inputs$selected_miRNA]
 
   list(
     prob = prob,
-    selected_features = selected_features,
+    selected_variables = selected_variables,
+    selected_miRNA = selected_miRNA,
     tuning = data.frame(
       model = "lasso",
-      n_selected_features = length(selected_features),
+      n_selected_miRNA = length(selected_miRNA),
       alpha = alpha_lasso,
       lambda = bestlam_lasso,
       stringsAsFactors = FALSE
