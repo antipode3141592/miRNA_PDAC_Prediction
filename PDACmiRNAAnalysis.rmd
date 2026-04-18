@@ -91,10 +91,13 @@ rf_ntree <- 300
 dt_maxdepth <- 7
 
 fold_filter_name <- "blocked limma"
-fold_filter_top_n <- 50
-design_covariates <- c("Sex", "Race", "Age")
+fold_filter_top_n <- 20
+demographic_covariates <- c("Sex", "Race", "Age")
+factor_demographic_covariates <- c("Sex", "Race")
+use_model_covariates <- TRUE
+
 limma_group_term <- "CC"
-limma_adjustment_covariates <- c("Sex", "Race", "Age")
+limma_adjustment_covariates <- demographic_covariates
 filter_stat_cols <- c(
   "miRNA",
   "mean_control",
@@ -109,16 +112,52 @@ filter_stat_cols <- c(
 )
 ```
 
+```{r write_comma_separated_list, include=FALSE}
+
+write_comma_separated_list <- function(items) {
+  if (length(items) == 0) {
+    return("")
+  } else if (length(items) == 1) {
+    return(items)
+  } else {
+    return(paste(
+      paste(items[-length(items)], collapse = ", "),
+      items[length(items)],
+      sep = ifelse(length(items) > 2, ", and ", " and ")
+    ))
+  }
+}
+
+```
+
 ```{r dev_block, include=FALSE}
 
 ##### DEVELOPMENT #####
-developmentMode <- FALSE
-development_excluded_models <- c("random_forest", "decision_tree")
+developmentMode <- TRUE
+development_use_model_covariates <- FALSE
+
 
 # models to exclude
 if (developmentMode) {
+  # development_excluded_models <- c("random_forest", "decision_tree")
+  development_excluded_models <- c()
+
+  use_model_covariates <- development_use_model_covariates
   model_names <- setdiff(model_names, development_excluded_models)
 }
+
+model_covariates <- if (use_model_covariates) demographic_covariates else character(0)
+model_covariate_text <- if (length(model_covariates)) {
+  write_comma_separated_list(model_covariates)
+} else {
+  "no demographic covariates"
+}
+model_design_text <- if (length(model_covariates)) {
+  paste("together with", model_covariate_text, "in the design")
+} else {
+  "without additional demographic covariates in the predictive design"
+}
+limma_adjustment_covariate_text <- write_comma_separated_list(limma_adjustment_covariates)
 
 ```
 
@@ -170,7 +209,7 @@ run_active_models <- function(fold_inputs, active_model_names = model_names) {
     stop(
       sprintf(
         "Requested models are not registered: %s",
-        paste(unknown_model_names, collapse = ", ")
+        write_comma_separated_list(unknown_model_names)
       ),
       call. = TRUE
     )
@@ -267,7 +306,7 @@ render_html_table(class_balance, caption = "Training and holdout class balance")
 ```
 
 ## Perform Differential Expression Filtering
-The limma filtering is based on a blocked linear model with duplicate-correlation adjustment for matched sets and is run once on the full training set. In that model, `r limma_group_term` is the term of interest and Sex, Race, and Age are adjustment covariates. The top N miRNAs are selected based on the smallest limma p-values, with ties broken by the absolute moderated t-statistic.
+The limma filtering is based on a blocked linear model with duplicate-correlation adjustment for matched sets and is run once on the full training set. In that model, `r limma_group_term` is the term of interest and `r limma_adjustment_covariate_text` are adjustment covariates. The top N miRNAs are selected based on the smallest limma p-values, with ties broken by the absolute moderated t-statistic.
 ```{r limma_filter_results, eval=FALSE, include=FALSE}
 train_filter_results <- differential_expression_filter_fn(
   train_fold_dat = train_set,
@@ -365,7 +404,7 @@ We perform a `r k`-fold cross-validation on the training set of paired samples, 
 
 Within each fold:
 1. We restrict the normalized count matrix to the top `r fold_filter_top_n` miRNAs selected from the limma analysis on the full training set.
-2. We then fit each model using that shared subset of miRNAs together with Sex, Race, and Age in the design. The `matched_set` identifier is used for grouped splitting and blocked limma, but not as a predictive covariate because holdout matched sets are unseen by construction.
+2. We then fit each model using that shared subset of miRNAs `r model_design_text`. The `matched_set` identifier is used for grouped splitting and blocked limma, but not as a predictive covariate because holdout matched sets are unseen by construction.
 ```{r fold_input_helpers, include=FALSE}
 map_to_training_levels <- function(values, training_levels) {
   if (!length(training_levels)) {
@@ -397,27 +436,23 @@ prepare_fold_inputs <- function(train_fold_dat, valid_fold_dat, selected_miRNA) 
     stop("Feature filtering returned zero miRNAs.", call. = TRUE)
   }
 
-  keep_cols <- c("CC", "CC_bin", design_covariates, selected_miRNA)
+  keep_cols <- c("CC", "CC_bin", model_covariates, selected_miRNA)
   train_model_dat <- train_fold_dat %>%
     dplyr::select(tidyselect::all_of(keep_cols)) %>%
-    droplevels() %>%
-    mutate(Age = as.numeric(.data$Age))
+    droplevels()
   valid_model_dat <- valid_fold_dat %>%
-    dplyr::select(tidyselect::all_of(keep_cols)) %>%
-    mutate(Age = as.numeric(.data$Age))
+    dplyr::select(tidyselect::all_of(keep_cols))
 
-  training_levels <- list(
-    Sex = levels(train_model_dat$Sex),
-    Race = levels(train_model_dat$Race)
-  )
+  factor_covariates <- intersect(factor_demographic_covariates, model_covariates)
 
-  valid_model_dat <- valid_model_dat %>%
-    mutate(
-      Sex = map_to_training_levels(.data$Sex, training_levels$Sex),
-      Race = map_to_training_levels(.data$Race, training_levels$Race)
+  for (covariate_name in factor_covariates) {
+    valid_model_dat[[covariate_name]] <- map_to_training_levels(
+      valid_model_dat[[covariate_name]],
+      levels(train_model_dat[[covariate_name]])
     )
+  }
 
-  raw_model_formula <- stats::reformulate(c(design_covariates, selected_miRNA), response = "CC_bin")
+  raw_model_formula <- stats::reformulate(c(model_covariates, selected_miRNA), response = "CC_bin")
   train_design_matrix <- stats::model.matrix(raw_model_formula, data = train_model_dat)
   valid_design_matrix <- stats::model.matrix(raw_model_formula, data = valid_model_dat)
   x_train <- train_design_matrix[, -1, drop = FALSE]
@@ -442,14 +477,14 @@ prepare_fold_inputs <- function(train_fold_dat, valid_fold_dat, selected_miRNA) 
 
   list(
     selected_miRNA = selected_miRNA,
-    design_covariates = design_covariates,
+    model_covariates = model_covariates,
     base_feature_cols = base_feature_cols,
     base_model_formula = base_model_formula,
     model_formula = model_formula,
     class_formula = class_formula,
     x_train = x_train,
     x_valid = x_valid,
-    penalty_factor = build_penalty_factor(design_feature_cols, design_covariates),
+    penalty_factor = build_penalty_factor(design_feature_cols, model_covariates),
     y_train = train_model_dat$CC_bin,
     train_model_dat = train_model_dat,
     valid_model_dat = valid_model_dat,
@@ -493,7 +528,8 @@ for (fold in 1:k) {
   fold_inputs <- prepare_fold_inputs(
     cv_train,
     cv_test,
-    train_filter_results$selected
+    top_ranked_miRNA$miRNA
+    # train_filter_results$selected
   )
 
   filter_sizes[fold] <- length(fold_inputs$selected_miRNA)
@@ -613,14 +649,15 @@ final_filter_results <- train_filter_results
 final_fold_inputs <- prepare_fold_inputs(
   train_set,
   holdout,
-  final_filter_results$selected
+  top_ranked_miRNA$miRNA
+  # train_filter_results$selected
 )
 
 cat(
   "<p>Number of final ",
   fold_filter_name,
   " selected miRNAs: ",
-  length(final_filter_results$selected),
+  length(top_ranked_miRNA$miRNA),
   "</p>\n",
   sep = ""
 )
