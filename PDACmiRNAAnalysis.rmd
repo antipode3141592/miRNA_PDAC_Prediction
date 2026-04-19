@@ -41,7 +41,7 @@ source("R/run_fold_rf.R")
 source("R/run_fold_dt.R")
 source("R/run_limma_paired.R")
 source("R/differential_expression_filter_fn.R")
-source("R/multi_mir_analysis.r")
+source("R/multi_mir_analysis.R")
 
 ```
 
@@ -91,14 +91,19 @@ lda_prior <- c(0.5, 0.5)
 rf_ntree <- 300
 dt_maxdepth <- 7
 
+log2_pseudocount <- 1
+run_limma_analysis <- TRUE
+
 fold_filter_name <- "blocked limma"
 fold_filter_top_n <- 20
 final_variable_heatmap_max_n <- fold_filter_top_n
+
 run_multimir_analysis <- TRUE
 multimir_results_rds_file <- "Data/Top-ranked consensus miRNA multiMiR results.rds"
 multimir_shared_gene_thresholds <- c(2L, 3L, 4L)
 multimir_pathway_enrichment_min_shared_miRNA <- 3L
 multimir_pathway_enrichment_top_terms <- 15L
+
 demographic_covariates <- c("Sex", "Race", "Age")
 factor_demographic_covariates <- c("Sex", "Race")
 use_model_covariates <- TRUE
@@ -235,15 +240,27 @@ run_active_models <- function(fold_inputs, active_model_names = model_names) {
 # Preparing Data
 
 ## Import Data
-We use the normalized miRNA count matrix from GEO and merge it with the demographic metadata.  Categorical variables are set to factors and the PDAC case and control variable is set to binary for modeling.
+We use the normalized miRNA count matrix from GEO, apply a single log2 transform with a pseudocount of `r log2_pseudocount`, and then merge it with the demographic metadata. Categorical variables are set to factors and the PDAC case and control variable is set to binary for modeling.
+
+That imported log-transformed miRNA matrix is then used throughout the analysis, including blocked limma and all downstream predictive modeling.
 
 ```{r data_import, include=FALSE}
 
 normalized_counts <- read_xlsx(normalized_data_file)
 metadata <- read_xlsx(metadata_file)
 
+# print qq plot of normalized miRNA counts before the log2 transform
+qqnorm(as.matrix(normalized_counts[, grep("^MIMAT", names(normalized_counts))]))
+qqline(as.matrix(normalized_counts[, grep("^MIMAT", names(normalized_counts))]))
+
+
 normalized_counts <- normalized_counts %>%
-  mutate(ID = as.character(.data$ID))
+  mutate(ID = as.character(.data$ID)) %>%
+  mutate(across(starts_with("MIMAT"), ~ log2(.x + log2_pseudocount)))
+
+# print qq plot of miRNA counts after the log2 transform
+qqnorm(as.matrix(normalized_counts[, grep("^MIMAT", names(normalized_counts))]))
+qqline(as.matrix(normalized_counts[, grep("^MIMAT", names(normalized_counts))]))
 
 metadata <- metadata %>%
   mutate(
@@ -313,8 +330,8 @@ render_html_table(class_balance, caption = "Training and holdout class balance")
 ```
 
 ## Perform Differential Expression Filtering
-The limma filtering is based on a blocked linear model with duplicate-correlation adjustment for matched sets and is run once on the full training set. In that model, `r limma_group_term` is the term of interest and `r limma_adjustment_covariate_text` are adjustment covariates. The top N miRNAs are selected based on the smallest limma p-values, with ties broken by the absolute moderated t-statistic.
-```{r limma_filter_results, eval=FALSE, include=FALSE}
+The limma filtering is based on a blocked linear model with duplicate-correlation adjustment for matched sets and is run once on the full training set. Because the miRNA columns are log2-transformed during import, blocked limma and the downstream predictive models operate on the same log-expression scale. In that model, `r limma_group_term` is the term of interest and `r limma_adjustment_covariate_text` are adjustment covariates. The top N miRNAs are selected based on the smallest limma p-values, with ties broken by the absolute moderated t-statistic. To avoid rerunning the expensive blocked-limma fit on every render, the report loads the saved full-training limma object by default; set `run_limma_analysis <- TRUE` once after changing upstream preprocessing if you need to rebuild `Data/Full train_filter_results.rds`.
+```{r limma_filter_results, eval=run_limma_analysis, include=FALSE}
 train_filter_results <- differential_expression_filter_fn(
   train_fold_dat = train_set,
   miRNA_cols = miRNA_all_columns,
@@ -325,14 +342,14 @@ train_filter_results <- differential_expression_filter_fn(
 )
 ```
 
-```{r store_limma_results, eval=FALSE, include=FALSE}
+```{r store_limma_results, eval=run_limma_analysis, include=FALSE}
 
 # store the full train_filter_results object to disk
 saveRDS(train_filter_results, "Data/Full train_filter_results.rds")
 
 ```
 
-```{r load_filter_results_from_disk, eval=TRUE, include=FALSE}
+```{r load_filter_results_from_disk, eval=!run_limma_analysis, include=FALSE}
 
 train_filter_results <- readRDS("Data/Full train_filter_results.rds")
 
@@ -410,9 +427,10 @@ k <- 5
 We perform a `r k`-fold cross-validation on the training set of paired samples, ensuring matched-samples are kept together in the same fold.
 
 Within each fold:
-1. We restrict the normalized count matrix to the top `r fold_filter_top_n` miRNAs selected from the limma analysis on the full training set.
-2. We then fit each model using that shared subset of miRNAs `r model_design_text`. The `matched_set` identifier is used for grouped splitting and blocked limma, but not as a predictive covariate because holdout matched sets are unseen by construction.
+1. We restrict the log2-transformed normalized count matrix to the top `r fold_filter_top_n` miRNAs selected from the limma analysis on the full training set.
+2. We then fit each model using that shared subset of selected miRNAs `r model_design_text`.
 ```{r fold_input_helpers, include=FALSE}
+
 map_to_training_levels <- function(values, training_levels) {
   if (!length(training_levels)) {
     stop("No training levels were available for factor alignment.", call. = TRUE)
@@ -1480,79 +1498,136 @@ Summarize validated target genes across the saved multiMiR results object for th
 
 multimir_gene_summary <- NULL
 
-if (!file.exists(multimir_results_rds_file)) {
+validated_target_summary <- multimir_results$validated$summary
+
+if (is.null(validated_target_summary) || nrow(validated_target_summary) == 0) {
   cat(
-    "<p>No saved multiMiR results RDS was found, so downstream target-gene summaries were skipped.</p>\n"
+    "<p>The saved multiMiR results did not contain any validated target summary rows.</p>\n"
   )
 } else {
-  multimir_results_from_disk <- readRDS(multimir_results_rds_file)
+  first_non_missing <- function(values) {
+    values <- values[!is.na(values) & values != ""]
 
-  validated_target_summary <- multimir_results_from_disk$validated$summary
-
-  if (is.null(validated_target_summary) || nrow(validated_target_summary) == 0) {
-    cat(
-      "<p>The saved multiMiR results did not contain any validated target summary rows.</p>\n"
-    )
-  } else {
-    first_non_missing <- function(values) {
-      values <- values[!is.na(values) & values != ""]
-
-      if (length(values)) {
-        values[[1]]
-      } else {
-        NA_character_
-      }
+    if (length(values)) {
+      values[[1]]
+    } else {
+      NA_character_
     }
-
-    multimir_gene_summary <- validated_target_summary %>%
-      mutate(
-        miRNA_label = if_else(
-          !is.na(.data$Annotation) & .data$Annotation != "",
-          .data$Annotation,
-          .data$miRNA
-        )
-      ) %>%
-      group_by(.data$target_symbol) %>%
-      summarise(
-        target_entrez = first_non_missing(.data$target_entrez),
-        target_ensembl = first_non_missing(.data$target_ensembl),
-        n_consensus_miRNA = n_distinct(.data$miRNA),
-        consensus_miRNA = write_comma_separated_list(sort(unique(.data$miRNA_label))),
-        total_validated_support = sum(.data$validated_support, na.rm = TRUE),
-        total_support = sum(.data$total_support, na.rm = TRUE),
-        max_models_selected = max(.data$n_models_selected, na.rm = TRUE),
-        .groups = "drop"
-      ) %>%
-      arrange(
-        desc(.data$n_consensus_miRNA),
-        desc(.data$total_validated_support),
-        desc(.data$total_support),
-        .data$target_symbol
-      )
-
-    write.csv(
-      multimir_gene_summary,
-      "Tables/Top-ranked Consensus miRNA multiMiR Target Gene Summary.csv",
-      row.names = FALSE
-    )
-
-    cat(
-      "<p>Loaded saved multiMiR results from ",
-      multimir_results_rds_file,
-      " and summarized ",
-      nrow(multimir_gene_summary),
-      " validated target genes across ",
-      nrow(multimir_results_from_disk$queried_miRNA),
-      " queried consensus miRNAs.</p>\n",
-      sep = ""
-    )
-
-    render_html_table(
-      utils::head(multimir_gene_summary, 20),
-      caption = "Validated target genes shared across the top-ranked consensus miRNA set"
-    )
   }
+
+  multimir_gene_summary <- validated_target_summary %>%
+    mutate(
+      miRNA_label = if_else(
+        !is.na(.data$Annotation) & .data$Annotation != "",
+        .data$Annotation,
+        .data$miRNA
+      )
+    ) %>%
+    group_by(.data$target_symbol) %>%
+    summarise(
+      target_entrez = first_non_missing(.data$target_entrez),
+      target_ensembl = first_non_missing(.data$target_ensembl),
+      n_consensus_miRNA = n_distinct(.data$miRNA),
+      consensus_miRNA = write_comma_separated_list(sort(unique(.data$miRNA_label))),
+      total_validated_support = sum(.data$validated_support, na.rm = TRUE),
+      total_support = sum(.data$total_support, na.rm = TRUE),
+      max_models_selected = max(.data$n_models_selected, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    arrange(
+      desc(.data$n_consensus_miRNA),
+      desc(.data$total_validated_support),
+      desc(.data$total_support),
+      .data$target_symbol
+    )
+
+  write.csv(
+    multimir_gene_summary,
+    "Tables/Top-ranked Consensus miRNA multiMiR Target Gene Summary.csv",
+    row.names = FALSE
+  )
+
+  cat(
+    "<p>Loaded saved multiMiR results from ",
+    multimir_results_rds_file,
+    " and summarized ",
+    nrow(multimir_gene_summary),
+    " validated target genes across ",
+    nrow(multimir_results$queried_miRNA),
+    " queried consensus miRNAs.</p>\n",
+    sep = ""
+  )
+
+  render_html_table(
+    utils::head(multimir_gene_summary, 20),
+    caption = "Validated target genes shared across the top-ranked consensus miRNA set"
+  )
 }
+
+```
+
+## Shared multiMiR Disease/Drug Terms
+Summarize disease/drug terms across the saved multiMiR results object for the full top-ranked consensus miRNA set.
+
+```{r multimir_disease_drug_top_terms, echo=FALSE, results='asis'}
+
+disease_association_summary <- multimir_results$disease_drug$summary
+
+if (is.null(disease_association_summary) || nrow(disease_association_summary) == 0) {
+  cat(
+    "<p>The saved multiMiR results did not contain any disease/drug association summary rows.</p>\n"
+  )
+} else {
+  multimir_disease_drug_summary <- disease_association_summary %>%
+    mutate(
+      miRNA_label = if_else(
+        !is.na(.data$Annotation) & .data$Annotation != "",
+        .data$Annotation,
+        .data$miRNA
+      ),
+      disease_drug = trimws(.data$disease_drug)
+    ) %>%
+    filter(!is.na(.data$disease_drug), .data$disease_drug != "") %>%
+    group_by(.data$disease_drug) %>%
+    summarise(
+      n_consensus_miRNA = n_distinct(.data$miRNA),
+      consensus_miRNA = write_comma_separated_list(sort(unique(.data$miRNA_label))),
+      total_records = sum(.data$n_records, na.rm = TRUE),
+      total_databases = sum(.data$n_databases, na.rm = TRUE),
+      total_pubmed = sum(.data$n_pubmed, na.rm = TRUE),
+      max_models_selected = max(.data$n_models_selected, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    arrange(
+      desc(.data$n_consensus_miRNA),
+      desc(.data$total_records),
+      desc(.data$total_pubmed),
+      .data$disease_drug
+    )
+
+  write.csv(
+    multimir_disease_drug_summary,
+    "Tables/Top-ranked Consensus miRNA multiMiR Disease-Drug Term Summary.csv",
+    row.names = FALSE
+  )
+
+  cat(
+    "<p>Loaded saved multiMiR results from ",
+    multimir_results_rds_file,
+    " and summarized ",
+    nrow(multimir_disease_drug_summary),
+    " disease/drug terms across ",
+    nrow(multimir_results$queried_miRNA),
+    " queried consensus miRNAs.</p>\n",
+    sep = ""
+  )
+
+  render_html_table(
+    multimir_disease_drug_summary,
+    caption = "Disease/drug terms shared across the top-ranked consensus miRNA set"
+  )
+}
+
 
 ```
 
