@@ -145,9 +145,8 @@ write_comma_separated_list <- function(items) {
 ```{r dev_block, include=FALSE}
 
 ##### DEVELOPMENT #####
-developmentMode <- TRUE
-development_use_model_covariates <- TRUE
-
+developmentMode <- FALSE
+development_use_model_covariates <- FALSE
 
 # models to exclude
 if (developmentMode) {
@@ -249,18 +248,14 @@ That imported log-transformed miRNA matrix is then used throughout the analysis,
 normalized_counts <- read_xlsx(normalized_data_file)
 metadata <- read_xlsx(metadata_file)
 
-# print qq plot of normalized miRNA counts before the log2 transform
-qqnorm(as.matrix(normalized_counts[, grep("^MIMAT", names(normalized_counts))]))
-qqline(as.matrix(normalized_counts[, grep("^MIMAT", names(normalized_counts))]))
+raw_miRNA_values <- as.numeric(as.matrix(normalized_counts[, grep("^MIMAT", names(normalized_counts))]))
 
 
 normalized_counts <- normalized_counts %>%
   mutate(ID = as.character(.data$ID)) %>%
   mutate(across(starts_with("MIMAT"), ~ log2(.x + log2_pseudocount)))
 
-# print qq plot of miRNA counts after the log2 transform
-qqnorm(as.matrix(normalized_counts[, grep("^MIMAT", names(normalized_counts))]))
-qqline(as.matrix(normalized_counts[, grep("^MIMAT", names(normalized_counts))]))
+transformed_miRNA_values <- as.numeric(as.matrix(normalized_counts[, grep("^MIMAT", names(normalized_counts))]))
 
 metadata <- metadata %>%
   mutate(
@@ -280,6 +275,37 @@ miRNA_all_columns <- grep("^MIMAT", names(full_dat), value = TRUE)
 
 cat("Rows/columns in merged dataset:", dim(full_dat), "\n")
 cat("Number of miRNA columns:", length(miRNA_all_columns), "\n")
+
+```
+
+The side-by-side QQ plots below show how the global miRNA value distribution shifts after the import-time log2 transform.
+
+```{r log2_transform_qq_comparison, echo=FALSE, fig.width=10, fig.height=5}
+
+plot_settings <- par(mfrow = c(1, 2), mar = c(4, 4, 3, 1))
+on.exit(par(plot_settings), add = TRUE)
+
+qqnorm(
+  raw_miRNA_values,
+  main = "Before Log2 Transform",
+  xlab = "Theoretical Quantiles",
+  ylab = "Sample Quantiles",
+  pch = 16,
+  cex = 0.3,
+  col = rgb(59 / 255, 91 / 255, 146 / 255, 0.25)
+)
+qqline(raw_miRNA_values, col = "#C65D3B", lwd = 2)
+
+qqnorm(
+  transformed_miRNA_values,
+  main = paste0("After Log2(x + ", log2_pseudocount, ")"),
+  xlab = "Theoretical Quantiles",
+  ylab = "Sample Quantiles",
+  pch = 16,
+  cex = 0.3,
+  col = rgb(59 / 255, 91 / 255, 146 / 255, 0.25)
+)
+qqline(transformed_miRNA_values, col = "#C65D3B", lwd = 2)
 
 ```
 
