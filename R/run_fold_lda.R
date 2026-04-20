@@ -10,6 +10,10 @@ run_fold_lda <- function(
   train_model_dat <- fold_inputs$train_design_dat[, c("CC", "CC_bin", predictor_cols), drop = FALSE]
   valid_model_dat <- fold_inputs$valid_design_dat[, c("CC", "CC_bin", predictor_cols), drop = FALSE]
 
+  scaled_model_data <- scale_fold_predictor_data(train_model_dat, valid_model_dat, selected_miRNA)
+  train_model_dat <- scaled_model_data$train
+  valid_model_dat <- scaled_model_data$valid
+
   lda_fit <- MASS::lda(
     class_formula,
     data = train_model_dat,
@@ -27,6 +31,7 @@ run_fold_lda <- function(
       n_selected_miRNA = length(selected_miRNA),
       n_features = length(selected_miRNA),
       prior = paste(prior, collapse = ","),
+      scaled_predictors = TRUE,
       stringsAsFactors = FALSE
     )
   )

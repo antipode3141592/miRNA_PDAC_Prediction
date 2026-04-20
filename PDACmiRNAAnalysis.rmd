@@ -35,6 +35,7 @@ library(mice)
 source("R/plotHelpers.R")
 source("R/run_fold_lasso.R")
 source("R/run_fold_enet.R")
+source("R/scale_fold_predictors.R")
 source("R/run_fold_forward_step.R")
 source("R/run_fold_lda.R")
 source("R/run_fold_rf.R")
@@ -88,14 +89,17 @@ enet_alpha_grid <- c(0.5, 0.6, 0.75, 0.9, 0.95)
 forward_step_max_steps <- 25
 lasso_alpha <- 1
 lda_prior <- c(0.5, 0.5)
-rf_ntree <- 300
-dt_maxdepth <- 7
+rf_ntree <- 500
+rf_mtry_grid <- c(5L, 10L, 20L, 30L)
+dt_maxdepth <- 6
+tree_model_names <- c("random_forest", "decision_tree")
+tree_model_feature_multiplier <- 3L
 
 log2_pseudocount <- 1
-run_limma_analysis <- TRUE
+run_limma_analysis <- FALSE
 
 fold_filter_name <- "blocked limma"
-fold_filter_top_n <- 20
+fold_filter_top_n <- 25
 final_variable_heatmap_max_n <- fold_filter_top_n
 
 run_multimir_analysis <- TRUE
@@ -122,6 +126,7 @@ filter_stat_cols <- c(
   "limma_adj_p_value",
   "limma_b"
 )
+
 ```
 
 ```{r write_comma_separated_list, include=FALSE}
@@ -202,7 +207,8 @@ model_runner_map <- list(
   random_forest = function(fold_inputs) {
     run_fold_rf(
       fold_inputs,
-      ntree = rf_ntree
+      ntree = rf_ntree,
+      mtry_grid = rf_mtry_grid
     )
   },
   decision_tree = function(fold_inputs) {
@@ -213,8 +219,41 @@ model_runner_map <- list(
   }
 )
 
-run_active_models <- function(fold_inputs, active_model_names = model_names) {
+select_top_limma_miRNA <- function(limma_stats, top_n) {
+  limma_stats %>%
+    slice_min(order_by = .data$limma_p_value, n = top_n, with_ties = TRUE) %>%
+    arrange(.data$limma_p_value, desc(abs(.data$limma_t)), .data$miRNA)
+}
+
+get_model_feature_pool_top_n <- function(model_name, base_top_n = fold_filter_top_n) {
+  if (model_name %in% tree_model_names) {
+    base_top_n * tree_model_feature_multiplier
+  } else {
+    base_top_n
+  }
+}
+
+prepare_model_fold_inputs <- function(train_fold_dat, valid_fold_dat, limma_stats, active_model_names = model_names) {
+  model_fold_inputs <- lapply(active_model_names, function(model_name) {
+    selected_miRNA <- select_top_limma_miRNA(
+      limma_stats,
+      top_n = get_model_feature_pool_top_n(model_name)
+    )$miRNA
+
+    prepare_fold_inputs(
+      train_fold_dat = train_fold_dat,
+      valid_fold_dat = valid_fold_dat,
+      selected_miRNA = selected_miRNA
+    )
+  })
+  names(model_fold_inputs) <- active_model_names
+
+  model_fold_inputs
+}
+
+run_active_models <- function(model_fold_inputs, active_model_names = model_names) {
   unknown_model_names <- setdiff(active_model_names, names(model_runner_map))
+  missing_fold_inputs <- setdiff(active_model_names, names(model_fold_inputs))
 
   if (length(unknown_model_names)) {
     stop(
@@ -226,8 +265,18 @@ run_active_models <- function(fold_inputs, active_model_names = model_names) {
     )
   }
 
+  if (length(missing_fold_inputs)) {
+    stop(
+      sprintf(
+        "Fold inputs were not prepared for: %s",
+        write_comma_separated_list(missing_fold_inputs)
+      ),
+      call. = TRUE
+    )
+  }
+
   model_outputs <- lapply(active_model_names, function(model_name) {
-    model_runner_map[[model_name]](fold_inputs)
+    model_runner_map[[model_name]](model_fold_inputs[[model_name]])
   })
   names(model_outputs) <- active_model_names
 
@@ -239,9 +288,7 @@ run_active_models <- function(fold_inputs, active_model_names = model_names) {
 # Preparing Data
 
 ## Import Data
-We use the normalized miRNA count matrix from GEO, apply a single log2 transform with a pseudocount of `r log2_pseudocount`, and then merge it with the demographic metadata. Categorical variables are set to factors and the PDAC case and control variable is set to binary for modeling.
-
-That imported log-transformed miRNA matrix is then used throughout the analysis, including blocked limma and all downstream predictive modeling.
+We use the normalized miRNA count matrix from GEO, apply a single log2 transform with a pseudocount of `r log2_pseudocount`, and then merge it with the demographic metadata. Categorical variables are set to factors and the PDAC case and control variable is set to binary for modeling. This ensures that the data is in a suitable format for downstream analysis, including differential expression analysis and predictive modeling.
 
 ```{r data_import, include=FALSE}
 
@@ -278,8 +325,6 @@ cat("Number of miRNA columns:", length(miRNA_all_columns), "\n")
 
 ```
 
-The side-by-side QQ plots below show how the global miRNA value distribution shifts after the import-time log2 transform.
-
 ```{r log2_transform_qq_comparison, echo=FALSE, fig.width=10, fig.height=5}
 
 plot_settings <- par(mfrow = c(1, 2), mar = c(4, 4, 3, 1))
@@ -308,6 +353,7 @@ qqnorm(
 qqline(transformed_miRNA_values, col = "#C65D3B", lwd = 2)
 
 ```
+The side-by-side QQ plots below show how the global miRNA value distribution shifts after the import-time log2 transform. The non-linearity of the miRNA counts is evident both before and after log2 transformation. Linearity is non a requirement for the downstream models, but the log2 transformation helps stabilize variance.
 
 ```{r missing_value_check, include=FALSE}
 
@@ -319,7 +365,6 @@ The dataset is fully observed with no missing values, so we can proceed without 
 
 ## Create Training and Holdout Sets
 To split the data while respecting matched-pairs, we performed the split on the matched set IDs, ensuring each pair is not split between sets.
-
 ```{r training_split, echo=FALSE, results='asis'}
 
 all_sets <- unique(full_dat$matched_set)
@@ -356,8 +401,9 @@ render_html_table(class_balance, caption = "Training and holdout class balance")
 ```
 
 ## Perform Differential Expression Filtering
-The limma filtering is based on a blocked linear model with duplicate-correlation adjustment for matched sets and is run once on the full training set. Because the miRNA columns are log2-transformed during import, blocked limma and the downstream predictive models operate on the same log-expression scale. In that model, `r limma_group_term` is the term of interest and `r limma_adjustment_covariate_text` are adjustment covariates. The top N miRNAs are selected based on the smallest limma p-values, with ties broken by the absolute moderated t-statistic. To avoid rerunning the expensive blocked-limma fit on every render, the report loads the saved full-training limma object by default; set `run_limma_analysis <- TRUE` once after changing upstream preprocessing if you need to rebuild `Data/Full train_filter_results.rds`.
+The limma filtering is based on a blocked linear model with duplicate-correlation adjustment for matched sets and is run once on the full training set. `r limma_group_term` is the term of interest and `r limma_adjustment_covariate_text` are adjustment covariates. The top N miRNAs are selected based on the smallest limma p-values, with ties broken by the absolute moderated t-statistic.
 ```{r limma_filter_results, eval=run_limma_analysis, include=FALSE}
+
 train_filter_results <- differential_expression_filter_fn(
   train_fold_dat = train_set,
   miRNA_cols = miRNA_all_columns,
@@ -366,6 +412,7 @@ train_filter_results <- differential_expression_filter_fn(
   group_term = limma_group_term,
   adjustment_covariates = limma_adjustment_covariates
 )
+
 ```
 
 ```{r store_limma_results, eval=run_limma_analysis, include=FALSE}
@@ -391,15 +438,16 @@ write.csv(
 
 ```
 
-## Top `r fold_filter_top_n` miRNAs selected by the blocked limma filter on the full training set
+## Top `r fold_filter_top_n` miRNAs Selected by Differential Expression
 ```{r top_limma_miRNA_table, echo=FALSE, results='asis'}
 
-# train_filter_results$selected is the vector of miRNAs passed downstream for modeling.
-# Here we show the top-ranked miRNAs by p-value with their limma statistics for context.
+# train_filter_results$selected is the default top-N limma vector passed to the non-tree models.
+# Here we show that default top-ranked set by p-value with its limma statistics for context.
 
-top_ranked_miRNA <- train_filter_results$stats %>%
-  slice_min(order_by = limma_p_value, n = fold_filter_top_n, with_ties = TRUE) %>%
-  arrange(limma_p_value, desc(abs(limma_t)), miRNA)
+top_ranked_miRNA <- select_top_limma_miRNA(
+  train_filter_results$stats,
+  top_n = fold_filter_top_n
+)
 
 render_html_table(
   top_ranked_miRNA,
@@ -442,19 +490,21 @@ overlap_table <- data.frame(
 )
 
 ```
-These top `r fold_filter_top_n` miRNAs are then used as the shared candidate feature set for all models in the subsequent cross-validation step, with the rationale that this filtering step is necessary to reduce the feature space to a level that can be effectively handled by the models given the sample size, while still being broad enough to allow for model-specific feature selection and not biasing towards any one model's selection criteria.
+These top `r fold_filter_top_n` miRNAs remain the default candidate feature set for the forward-step, lasso, elastic-net, and LDA models in the subsequent cross-validation step. The random forest and decision tree models are instead given the top `r fold_filter_top_n * tree_model_feature_multiplier` blocked-limma miRNAs so the tree-based models can search a somewhat broader input pool.
 
 # Cross-Validation Loop
 ```{r k_definition, include=FALSE}
 
-k <- 5
+k <- 10
 
 ```
 We perform a `r k`-fold cross-validation on the training set of paired samples, ensuring matched-samples are kept together in the same fold.
 
 Within each fold:
-1. We restrict the log2-transformed normalized count matrix to the top `r fold_filter_top_n` miRNAs selected from the limma analysis on the full training set.
-2. We then fit each model using that shared subset of selected miRNAs `r model_design_text`.
+1. We restrict the log2-transformed normalized count matrix to the top `r fold_filter_top_n` limma-selected miRNAs for the forward-step, lasso, elastic-net, and LDA models, and to the top `r fold_filter_top_n * tree_model_feature_multiplier` limma-selected miRNAs for the random forest and decision tree models.
+2. We then fit each model using its assigned limma-preselected miRNA pool `r model_design_text`.
+3. The LDA and forward-step models additionally standardize only the selected miRNA log-count columns using training-fold means and standard deviations before fitting, and apply the same transformation to the corresponding validation data.
+4. The random forest model additionally evaluates `r write_comma_separated_list(rf_mtry_grid)` as candidate `mtry` values and keeps the fit with the lowest out-of-bag classification error.
 ```{r fold_input_helpers, include=FALSE}
 
 map_to_training_levels <- function(values, training_levels) {
@@ -580,13 +630,14 @@ cv_predictions <- list()
 feature_tracker <- list()
 tuning_tracker <- list()
 feature_count_tracker <- list()
-filter_sizes <- integer(k)
+preselected_feature_count_tracker <- list()
 
 for (model_name in model_names) {
   cv_predictions[[model_name]] <- list()
   feature_tracker[[model_name]] <- list()
   tuning_tracker[[model_name]] <- list()
   feature_count_tracker[[model_name]] <- integer(k)
+  preselected_feature_count_tracker[[model_name]] <- integer(k)
 }
 
 for (fold in 1:k) {
@@ -597,18 +648,16 @@ for (fold in 1:k) {
   cv_train <- train_set %>% filter(!matched_set %in% test_sets)
   cv_test <- train_set %>% filter(matched_set %in% test_sets)
 
-  fold_inputs <- prepare_fold_inputs(
+  model_fold_inputs <- prepare_model_fold_inputs(
     cv_train,
     cv_test,
-    top_ranked_miRNA$miRNA
-    # train_filter_results$selected
+    train_filter_results$stats
   )
 
-  filter_sizes[fold] <- length(fold_inputs$selected_miRNA)
-
-  model_outputs <- run_active_models(fold_inputs)
+  model_outputs <- run_active_models(model_fold_inputs)
 
   for (model_name in model_names) {
+    model_inputs <- model_fold_inputs[[model_name]]
     model_out <- model_outputs[[model_name]]
 
     cv_predictions[[model_name]][[fold]] <- data.frame(
@@ -623,6 +672,7 @@ for (fold in 1:k) {
     feature_tracker[[model_name]][[fold]] <- model_out$selected_miRNA
     tuning_tracker[[model_name]][[fold]] <- model_out$tuning
     feature_count_tracker[[model_name]][fold] <- length(model_out$selected_miRNA)
+    preselected_feature_count_tracker[[model_name]][fold] <- length(model_inputs$selected_miRNA)
   }
 }
 
@@ -700,15 +750,18 @@ for (model_name in model_names) {
   )
 }
 
-fold_filter_summary <- data.frame(
-  fold = seq_along(filter_sizes),
-  n_selected_miRNA = filter_sizes,
-  row.names = NULL
-)
+fold_filter_summary <- bind_rows(lapply(model_names, function(model_name) {
+  data.frame(
+    model = model_display_name(model_name),
+    fold = seq_along(preselected_feature_count_tracker[[model_name]]),
+    n_preselected_miRNA = preselected_feature_count_tracker[[model_name]],
+    row.names = NULL
+  )
+}))
 
 render_html_table(
   fold_filter_summary,
-  caption = paste("Number of", fold_filter_name, "preselected miRNAs available by fold")
+  caption = paste("Number of", fold_filter_name, "preselected miRNAs supplied to each model by fold")
 )
 
 ```
@@ -718,23 +771,33 @@ Evaluate the final fold, using the calibrated models from the CV step, on the ho
 ```{r holdout_evaluation, include=FALSE}
 
 final_filter_results <- train_filter_results
-final_fold_inputs <- prepare_fold_inputs(
+final_fold_inputs_by_model <- prepare_model_fold_inputs(
   train_set,
   holdout,
-  top_ranked_miRNA$miRNA
-  # train_filter_results$selected
+  train_filter_results$stats
 )
+
+default_feature_pool_size <- length(select_top_limma_miRNA(
+  final_filter_results$stats,
+  top_n = fold_filter_top_n
+)$miRNA)
+tree_feature_pool_size <- length(select_top_limma_miRNA(
+  final_filter_results$stats,
+  top_n = fold_filter_top_n * tree_model_feature_multiplier
+)$miRNA)
 
 cat(
   "<p>Number of final ",
   fold_filter_name,
-  " selected miRNAs: ",
-  length(top_ranked_miRNA$miRNA),
+  " selected miRNAs supplied to the forward-step/lasso/elastic-net/LDA pool: ",
+  default_feature_pool_size,
+  "; supplied to the random-forest/decision-tree pool: ",
+  tree_feature_pool_size,
   "</p>\n",
   sep = ""
 )
 
-final_model_outputs <- run_active_models(final_fold_inputs)
+final_model_outputs <- run_active_models(final_fold_inputs_by_model)
 ```
 
 ```{r holdout_predictions, echo=FALSE, results='asis'}
@@ -742,7 +805,7 @@ final_model_outputs <- run_active_models(final_fold_inputs)
 holdout_predictions <- bind_rows(lapply(model_names, function(model_name) {
   data.frame(
     model = model_name,
-    observed = final_fold_inputs$valid_model_dat$CC_bin,
+    observed = final_fold_inputs_by_model[[model_name]]$valid_model_dat$CC_bin,
     prob = as.numeric(final_model_outputs[[model_name]]$prob),
     stringsAsFactors = FALSE
   )
@@ -1094,7 +1157,7 @@ render_html_table(
 )
 
 roc_curves <- lapply(model_names, function(model_name) {
-  roc(final_fold_inputs$valid_model_dat$CC_bin, final_model_outputs[[model_name]]$prob, quiet = TRUE)
+  roc(final_fold_inputs_by_model[[model_name]]$valid_model_dat$CC_bin, final_model_outputs[[model_name]]$prob, quiet = TRUE)
 })
 names(roc_curves) <- model_names
 
@@ -1654,30 +1717,60 @@ if (is.null(disease_association_summary) || nrow(disease_association_summary) ==
   )
 }
 
+# multimir_disease_drug_summary
 
 ```
 
 # Final Summary Table of the Top-Ranked Consensus miRNAs
 A table of the top-ranked consensus miRNAs with their blocked-limma statistics, model selection counts, and annotation names.
 
-```{r consensus_features, echo=FALSE, results='asis'}
+```{r summary_table_consensus_features, echo=FALSE, results='asis'}
 
 final_feature_table <- top_ranked_miRNA_details %>%
   dplyr::select(
     miRNA,
     Annotation,
-    multiMiR_query_id,
-    n_models_selected,
-    tidyselect::all_of(filter_stat_cols[filter_stat_cols != "miRNA"])
+    mean_control,
+    mean_case,
+    mean_diff,
+    limma_p_value
   )
 
-write.csv(final_feature_table, "Tables/Final Consensus Features.csv", row.names = FALSE)
+final_feature_table <- final_feature_table %>%
+  left_join(
+    multimir_results$validated$summary %>%
+      filter(!is.na(.data$target_symbol) & .data$target_symbol != "") %>%
+      group_by(.data$miRNA) %>%
+      summarise(
+        n_target_genes = n_distinct(.data$target_symbol),
+        .groups = "drop"
+      ),
+    by = c("miRNA")
+  ) %>%
+  left_join(
+    multimir_results$disease_drug$summary %>%
+      filter(!is.na(.data$disease_drug) & .data$disease_drug != "") %>%
+      group_by(.data$miRNA) %>%
+      summarise(
+        n_disease_drug_terms = n_distinct(.data$disease_drug),
+        .groups = "drop"
+      ),
+    by = c("miRNA")
+  ) %>%
+  mutate(
+    n_target_genes = dplyr::coalesce(.data$n_target_genes, 0L),
+    n_disease_drug_terms = dplyr::coalesce(.data$n_disease_drug_terms, 0L)
+  )
+
+write.csv(final_feature_table, "Tables/Summary of Consensus miRNAs.csv", row.names = FALSE)
 
 render_html_table(
   final_feature_table,
   caption = "Top-ranked consensus miRNAs summary",
   digits = 3
 )
+
+# final_feature_table
 
 ```
 

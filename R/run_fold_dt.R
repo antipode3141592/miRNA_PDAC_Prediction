@@ -1,4 +1,4 @@
-run_fold_dt <- function(fold_inputs, cp_dt = 0.01, maxdepth = 10) {
+run_fold_dt <- function(fold_inputs, cp_dt = 0.001, maxdepth = 20) {
   dt_fit <- rpart::rpart(
     fold_inputs$class_formula,
     data = fold_inputs$train_design_dat,
