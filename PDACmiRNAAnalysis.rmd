@@ -148,6 +148,56 @@ write_comma_separated_list <- function(items) {
   }
 }
 
+build_binary_confusion_summary <- function(
+  observed,
+  predicted_prob,
+  threshold = 0.5
+) {
+  if (length(observed) != length(predicted_prob)) {
+    stop("Observed outcomes and predicted probabilities must have the same length.", call. = TRUE)
+  }
+
+  predicted_class <- ifelse(predicted_prob > threshold, 1, 0)
+  class_levels <- c("Controls", "PDAC case")
+
+  confusion_table <- table(
+    Prediction = factor(predicted_class, levels = c(0, 1), labels = class_levels),
+    Reference = factor(observed, levels = c(0, 1), labels = class_levels)
+  )
+
+  true_positive <- sum(predicted_class == 1 & observed == 1, na.rm = TRUE)
+  false_positive <- sum(predicted_class == 1 & observed == 0, na.rm = TRUE)
+  false_negative <- sum(predicted_class == 0 & observed == 1, na.rm = TRUE)
+
+  precision <- if ((true_positive + false_positive) > 0) {
+    true_positive / (true_positive + false_positive)
+  } else {
+    NA_real_
+  }
+
+  recall <- if ((true_positive + false_negative) > 0) {
+    true_positive / (true_positive + false_negative)
+  } else {
+    NA_real_
+  }
+
+  f1_score <- if (is.finite(precision) && is.finite(recall) && (precision + recall) > 0) {
+    2 * precision * recall / (precision + recall)
+  } else {
+    NA_real_
+  }
+
+  list(
+    table = confusion_table,
+    byClass = c(
+      Precision = precision,
+      Recall = recall,
+      F1 = f1_score
+    ),
+    threshold = threshold
+  )
+}
+
 ```
 
 ```{r dev_block, include=FALSE}
@@ -829,6 +879,16 @@ holdout_predictions <- bind_rows(lapply(model_names, function(model_name) {
     predicted_class = if_else(.data$prob > 0.5, 1, 0)
   )
 
+for (model_name in model_names) {
+  model_holdout_predictions <- holdout_predictions %>%
+    filter(.data$model == model_name)
+
+  final_model_outputs[[model_name]]$confusion_matrix <- build_binary_confusion_summary(
+    observed = model_holdout_predictions$observed,
+    predicted_prob = model_holdout_predictions$prob
+  )
+}
+
 holdout_summary <- holdout_predictions %>%
   group_by(.data$model) %>%
   summarise(
@@ -1425,6 +1485,70 @@ cat(
 
 ```
 
+## Confusion Matrices for Final Models
+```{r confusion_matrices, echo=FALSE, results='asis'}
+
+confusion_matrices <- lapply(model_names, function(model_name) {
+  model_outputs <- final_model_outputs[[model_name]]
+  if (is.null(model_outputs$confusion_matrix)) {
+    return(NULL)
+  }
+
+  cm <- model_outputs$confusion_matrix
+  cm_table <- as.data.frame(cm$table)
+  cm_table$model <- model_name
+  cm_table
+})
+
+confusion_matrices <- bind_rows(confusion_matrices)
+
+write.csv(confusion_matrices, "Tables/Confusion Matrices.csv", row.names = FALSE)
+
+render_html_table(
+  confusion_matrices,
+  caption = "Confusion Matrices for Final Models"
+)
+
+```
+
+## Precision, Recall, and F1 Score for Final Models
+
+```{r precision_recall_f1, echo=FALSE, results='asis'}
+
+precision_recall_f1_summary <- bind_rows(lapply(model_names, function(model_name) {
+  model_outputs <- final_model_outputs[[model_name]]
+  if (is.null(model_outputs$confusion_matrix)) {
+    return(data.frame(
+      model = model_name,
+      precision = NA_real_,
+      recall = NA_real_,
+      f1_score = NA_real_
+    ))
+  }
+
+  cm <- model_outputs$confusion_matrix
+  precision <- cm$byClass["Precision"]
+  recall <- cm$byClass["Recall"]
+  f1_score <- cm$byClass["F1"]
+
+  data.frame(
+    model = model_name,
+    precision = precision,
+    recall = recall,
+    f1_score = f1_score
+  )
+}))
+
+write.csv(precision_recall_f1_summary, "Tables/Precision_Recall_F1_Summary.csv", row.names = FALSE)
+
+render_html_table(
+  precision_recall_f1_summary,
+  caption = "Precision, Recall, and F1 Score for Final Models",
+  digits = 3
+)
+
+```
+
 # Selected miRNA Features and Interpretation
 
 ## Final selected miRNA across non-tree models
@@ -1679,11 +1803,8 @@ if (nrow(top_ranked_variable_details) > 1) {
 
 ## Comparison of Top-Ranked miRNA by Decision Tree and Random Forest
 ```{r comparison_tree_features, fig.height=6, fig.width=8}
-decision_tree_top_miRNA <- decision_tree_results$selected_miRNA
-random_forest_top_miRNA <- final_model_variable_counts %>%
-  filter(variable_type == "miRNA") %>%
-  slice_max(order_by = n_models_selected, n = 1, with_ties = TRUE) %>%
-  pull(variable)
+decision_tree_top_miRNA <- final_model_outputs[["decision_tree"]]$selected_miRNA
+random_forest_top_miRNA <- final_model_outputs[["random_forest"]]$selected_miRNA
 
 comparison_df <- tibble(
   miRNA = union(decision_tree_top_miRNA, random_forest_top_miRNA),
@@ -1706,6 +1827,17 @@ Assess validated target and disease/drug associations for the top-ranked consens
 ```{r multi_mir_analysis, eval=run_multimir_analysis, echo=FALSE, results='asis'}
 
 multimir_results <- run_multi_mir_analysis(top_ranked_miRNA_details)
+
+if (nrow(multimir_results$query_failures) > 0) {
+  cat(
+    "<p>",
+    nrow(multimir_results$query_failures),
+    " multiMiR query call",
+    if (nrow(multimir_results$query_failures) == 1) " was" else "s were",
+    " skipped after returning an error. The report will continue with any successful multiMiR results.</p>\n",
+    sep = ""
+  )
+}
 
 if (nrow(multimir_results$queried_miRNA) == 0) {
   cat("<p>No valid miRNA annotation was available for the top-ranked consensus miRNA set, so multiMiR queries were skipped.</p>\n")

@@ -49,6 +49,23 @@ summary_column <- function(data_frame, column_name) {
 }
 
 summarize_validated_targets <- function(query_row, validated_multimir_summary) {
+  if (!nrow(validated_multimir_summary)) {
+    return(data.frame(
+      miRNA = character(0),
+      Annotation = character(0),
+      multiMiR_query_id = character(0),
+      n_models_selected = numeric(0),
+      target_symbol = character(0),
+      target_entrez = character(0),
+      target_ensembl = character(0),
+      validated_support = numeric(0),
+      total_support = numeric(0),
+      row.names = NULL,
+      check.names = FALSE,
+      stringsAsFactors = FALSE
+    ))
+  }
+
   validated_target_summary <- data.frame(
     miRNA = query_row$miRNA[[1]],
     Annotation = query_row$Annotation[[1]],
@@ -108,6 +125,18 @@ has_rows <- function(data_frame) {
   nrow(data_frame) > 0
 }
 
+normalize_disease_drug_data <- function(disease_multimir_data) {
+  required_columns <- c("disease_drug", "database", "paper_pubmedID")
+
+  for (column_name in required_columns) {
+    if (!(column_name %in% names(disease_multimir_data))) {
+      disease_multimir_data[[column_name]] <- rep(NA_character_, nrow(disease_multimir_data))
+    }
+  }
+
+  disease_multimir_data
+}
+
 run_multi_mir_analysis <- function(miRNA_details) {
   consensus_miRNA_details <- miRNA_details[
     !duplicated(miRNA_details$miRNA),
@@ -137,6 +166,14 @@ run_multi_mir_analysis <- function(miRNA_details) {
       raw_data = data.frame(),
       summary = data.frame(),
       total_record_count = 0L
+    ),
+    query_failures = data.frame(
+      miRNA = character(0),
+      multiMiR_query_id = character(0),
+      table_name = character(0),
+      error_message = character(0),
+      stringsAsFactors = FALSE,
+      check.names = FALSE
     )
   )
 
@@ -150,6 +187,7 @@ run_multi_mir_analysis <- function(miRNA_details) {
   validated_summary_list <- vector("list", nrow(queried_miRNA))
   disease_raw_data_list <- vector("list", nrow(queried_miRNA))
   disease_summary_list <- vector("list", nrow(queried_miRNA))
+  query_failures <- list()
 
   names(validated_per_query) <- queried_miRNA$miRNA
   names(disease_per_query) <- queried_miRNA$miRNA
@@ -158,26 +196,68 @@ run_multi_mir_analysis <- function(miRNA_details) {
     query_row <- queried_miRNA[query_index, , drop = FALSE]
     query_id <- query_row$multiMiR_query_id[[1]]
 
-    validated_multimir <- run_multimir_query(
-      mirna_id = query_id,
-      table_name = "validated",
-      summary = TRUE
-    )
-    validated_multimir_data <- as.data.frame(validated_multimir@data)
-    validated_multimir_summary <- as.data.frame(validated_multimir@summary)
+    validated_multimir_data <- data.frame()
+    validated_multimir_summary <- data.frame()
 
-    disease_multimir <- run_multimir_query(
-      mirna_id = query_id,
-      table_name = "disease.drug",
-      summary = FALSE
+    validated_multimir <- tryCatch(
+      run_multimir_query(
+        mirna_id = query_id,
+        table_name = "validated",
+        summary = TRUE
+      ),
+      error = function(err) {
+        query_failures[[length(query_failures) + 1L]] <<- data.frame(
+          miRNA = query_row$miRNA[[1]],
+          multiMiR_query_id = query_id,
+          table_name = "validated",
+          error_message = conditionMessage(err),
+          row.names = NULL,
+          stringsAsFactors = FALSE,
+          check.names = FALSE
+        )
+
+        NULL
+      }
     )
-    disease_multimir_data <- as.data.frame(disease_multimir@data)
-    disease_multimir_data <- disease_multimir_data[
-      !is.na(disease_multimir_data$disease_drug) &
-        disease_multimir_data$disease_drug != "",
-      ,
-      drop = FALSE
-    ]
+
+    if (!is.null(validated_multimir)) {
+      validated_multimir_data <- as.data.frame(validated_multimir@data)
+      validated_multimir_summary <- as.data.frame(validated_multimir@summary)
+    }
+
+    disease_multimir_data <- data.frame()
+
+    disease_multimir <- tryCatch(
+      run_multimir_query(
+        mirna_id = query_id,
+        table_name = "disease.drug",
+        summary = FALSE
+      ),
+      error = function(err) {
+        query_failures[[length(query_failures) + 1L]] <<- data.frame(
+          miRNA = query_row$miRNA[[1]],
+          multiMiR_query_id = query_id,
+          table_name = "disease.drug",
+          error_message = conditionMessage(err),
+          row.names = NULL,
+          stringsAsFactors = FALSE,
+          check.names = FALSE
+        )
+
+        NULL
+      }
+    )
+
+    if (!is.null(disease_multimir)) {
+      disease_multimir_data <- as.data.frame(disease_multimir@data)
+      disease_multimir_data <- normalize_disease_drug_data(disease_multimir_data)
+      disease_multimir_data <- disease_multimir_data[
+        !is.na(disease_multimir_data$disease_drug) &
+          disease_multimir_data$disease_drug != "",
+        ,
+        drop = FALSE
+      ]
+    }
 
     validated_per_query[[query_index]] <- list(
       query = query_row,
@@ -202,6 +282,10 @@ run_multi_mir_analysis <- function(miRNA_details) {
 
   multimir_results$validated$per_query <- validated_per_query
   multimir_results$disease_drug$per_query <- disease_per_query
+
+  if (length(query_failures) > 0) {
+    multimir_results$query_failures <- dplyr::bind_rows(query_failures)
+  }
 
   if (length(validated_raw_data_list) > 0) {
     multimir_results$validated$raw_data <- dplyr::bind_rows(validated_raw_data_list)
