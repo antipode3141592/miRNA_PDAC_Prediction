@@ -91,15 +91,18 @@ lasso_alpha <- 1
 lda_prior <- c(0.5, 0.5)
 rf_ntree <- 500
 rf_mtry_grid <- c(5L, 10L, 20L, 30L)
-dt_maxdepth <- 6
+dt_maxdepth <- 30
 tree_model_names <- c("random_forest", "decision_tree")
-tree_model_feature_multiplier <- 3L
 
 log2_pseudocount <- 1
 run_limma_analysis <- FALSE
 
 fold_filter_name <- "blocked limma"
 fold_filter_top_n <- 25
+rf_top_m_features <- fold_filter_top_n
+rf_importance_metric <- "MeanDecreaseAccuracy"
+rf_importance_plot_top_n <- max(20L, rf_top_m_features)
+dt_importance_plot_top_n <- max(20L, fold_filter_top_n)
 final_variable_heatmap_max_n <- fold_filter_top_n
 
 run_multimir_analysis <- TRUE
@@ -174,6 +177,7 @@ model_design_text <- if (length(model_covariates)) {
   "without additional demographic covariates in the predictive design"
 }
 limma_adjustment_covariate_text <- write_comma_separated_list(limma_adjustment_covariates)
+consensus_model_names <- setdiff(model_names, tree_model_names)
 
 ```
 
@@ -208,7 +212,9 @@ model_runner_map <- list(
     run_fold_rf(
       fold_inputs,
       ntree = rf_ntree,
-      mtry_grid = rf_mtry_grid
+      mtry_grid = rf_mtry_grid,
+      top_m_features = rf_top_m_features,
+      importance_metric = rf_importance_metric
     )
   },
   decision_tree = function(fold_inputs) {
@@ -225,20 +231,32 @@ select_top_limma_miRNA <- function(limma_stats, top_n) {
     arrange(.data$limma_p_value, desc(abs(.data$limma_t)), .data$miRNA)
 }
 
-get_model_feature_pool_top_n <- function(model_name, base_top_n = fold_filter_top_n) {
+get_model_preselected_miRNA <- function(
+  model_name,
+  limma_stats,
+  all_miRNA = miRNA_all_columns,
+  base_top_n = fold_filter_top_n
+) {
   if (model_name %in% tree_model_names) {
-    base_top_n * tree_model_feature_multiplier
+    all_miRNA
   } else {
-    base_top_n
+    select_top_limma_miRNA(limma_stats, top_n = base_top_n)$miRNA
   }
 }
 
-prepare_model_fold_inputs <- function(train_fold_dat, valid_fold_dat, limma_stats, active_model_names = model_names) {
+prepare_model_fold_inputs <- function(
+  train_fold_dat,
+  valid_fold_dat,
+  limma_stats,
+  active_model_names = model_names,
+  all_miRNA = miRNA_all_columns
+) {
   model_fold_inputs <- lapply(active_model_names, function(model_name) {
-    selected_miRNA <- select_top_limma_miRNA(
-      limma_stats,
-      top_n = get_model_feature_pool_top_n(model_name)
-    )$miRNA
+    selected_miRNA <- get_model_preselected_miRNA(
+      model_name = model_name,
+      limma_stats = limma_stats,
+      all_miRNA = all_miRNA
+    )
 
     prepare_fold_inputs(
       train_fold_dat = train_fold_dat,
@@ -490,19 +508,19 @@ overlap_table <- data.frame(
 )
 
 ```
-These top `r fold_filter_top_n` miRNAs remain the default candidate feature set for the forward-step, lasso, elastic-net, and LDA models in the subsequent cross-validation step. The random forest and decision tree models are instead given the top `r fold_filter_top_n * tree_model_feature_multiplier` blocked-limma miRNAs so the tree-based models can search a somewhat broader input pool.
+These top `r fold_filter_top_n` miRNAs remain the default candidate feature set for the forward-step, lasso, elastic-net, and LDA models in the subsequent cross-validation step. The random forest and decision tree models are instead given the full log2-transformed miRNA set without limma prefiltering.
 
 # Cross-Validation Loop
 ```{r k_definition, include=FALSE}
 
-k <- 10
+k <- 5
 
 ```
 We perform a `r k`-fold cross-validation on the training set of paired samples, ensuring matched-samples are kept together in the same fold.
 
 Within each fold:
-1. We restrict the log2-transformed normalized count matrix to the top `r fold_filter_top_n` limma-selected miRNAs for the forward-step, lasso, elastic-net, and LDA models, and to the top `r fold_filter_top_n * tree_model_feature_multiplier` limma-selected miRNAs for the random forest and decision tree models.
-2. We then fit each model using its assigned limma-preselected miRNA pool `r model_design_text`.
+1. We restrict the log2-transformed normalized count matrix to the top `r fold_filter_top_n` limma-selected miRNAs for the forward-step, lasso, elastic-net, and LDA models, while the random forest and decision tree models receive the full log2-transformed miRNA set without limma prefiltering.
+2. We then fit each model using its assigned miRNA input pool `r model_design_text`.
 3. The LDA and forward-step models additionally standardize only the selected miRNA log-count columns using training-fold means and standard deviations before fitting, and apply the same transformation to the corresponding validation data.
 4. The random forest model additionally evaluates `r write_comma_separated_list(rf_mtry_grid)` as candidate `mtry` values and keeps the fit with the lowest out-of-bag classification error.
 ```{r fold_input_helpers, include=FALSE}
@@ -767,7 +785,7 @@ render_html_table(
 ```
 
 ## Holdout Evaluation
-Evaluate the final fold, using the calibrated models from the CV step, on the holdout set. We report AUC and accuracy for each model on the holdout set, as well as the number of features selected in each final model and the number of miRNAs that passed the initial limma filter.
+Evaluate the final fold, using the calibrated models from the CV step, on the holdout set. We report AUC and accuracy for each model on the holdout set, as well as the number of features selected in each final model and the size of each model's input miRNA pool.
 ```{r holdout_evaluation, include=FALSE}
 
 final_filter_results <- train_filter_results
@@ -781,17 +799,14 @@ default_feature_pool_size <- length(select_top_limma_miRNA(
   final_filter_results$stats,
   top_n = fold_filter_top_n
 )$miRNA)
-tree_feature_pool_size <- length(select_top_limma_miRNA(
-  final_filter_results$stats,
-  top_n = fold_filter_top_n * tree_model_feature_multiplier
-)$miRNA)
+tree_feature_pool_size <- length(miRNA_all_columns)
 
 cat(
   "<p>Number of final ",
   fold_filter_name,
   " selected miRNAs supplied to the forward-step/lasso/elastic-net/LDA pool: ",
   default_feature_pool_size,
-  "; supplied to the random-forest/decision-tree pool: ",
+  "; supplied to the random-forest/decision-tree pool (full miRNA set): ",
   tree_feature_pool_size,
   "</p>\n",
   sep = ""
@@ -1057,6 +1072,204 @@ cat(
 
 ```
 
+### Random Forest Feature Importance
+Rank the final random-forest miRNA candidates by holdout-model feature importance and retain the top M miRNA as the final RF miRNA list.
+
+```{r random_forest_feature_importance, echo=FALSE, results='asis', fig.width=8, fig.height=6}
+
+rf_final_importance <- final_model_outputs[["random_forest"]]$feature_importance
+rf_final_importance_miRNA <- rf_final_importance %>%
+  filter(.data$variable_type == "miRNA")
+
+if (!nrow(rf_final_importance_miRNA)) {
+  stop("The final random-forest model did not return any miRNA feature-importance values.", call. = TRUE)
+}
+
+rf_final_selected_miRNA <- rf_final_importance_miRNA %>%
+  filter(.data$selected_for_final)
+
+rf_importance_rows_to_show <- min(
+  rf_importance_plot_top_n,
+  nrow(rf_final_importance_miRNA)
+)
+
+write.csv(
+  rf_final_importance,
+  "Tables/Random Forest Feature Importance.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  rf_final_selected_miRNA,
+  "Tables/Random Forest Top Ranked miRNA.csv",
+  row.names = FALSE
+)
+
+cat(
+  sprintf(
+    "<p>The final random-forest miRNA list keeps the top %d miRNA ranked by %s from the best OOB forest.</p>\n",
+    nrow(rf_final_selected_miRNA),
+    rf_final_importance_miRNA$importance_metric[[1]]
+  )
+)
+
+rf_feature_importance_table <- rf_final_importance_miRNA %>%
+  slice_head(n = rf_importance_rows_to_show) %>%
+  mutate(selected_for_final = if_else(.data$selected_for_final, "Yes", "No")) %>%
+  dplyr::select(
+    importance_rank,
+    variable,
+    importance_value,
+    MeanDecreaseAccuracy,
+    MeanDecreaseGini,
+    selected_for_final
+  )
+
+render_html_table(
+  rf_feature_importance_table,
+  caption = "Random-forest miRNA feature-importance ranking on the final holdout model",
+  digits = 3
+)
+
+rf_feature_importance_plot_data <- rf_final_importance_miRNA %>%
+  slice_head(n = rf_importance_rows_to_show) %>%
+  mutate(
+    selected_for_final = if_else(.data$selected_for_final, "Top M retained", "Ranked only"),
+    variable = factor(.data$variable, levels = rev(.data$variable))
+  )
+
+rf_feature_importance_plot <- ggplot(
+  rf_feature_importance_plot_data,
+  aes(x = .data$variable, y = .data$importance_value, fill = .data$selected_for_final)
+) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_manual(values = c("Top M retained" = "#2C7FB8", "Ranked only" = "#B7D4E8")) +
+  labs(
+    title = "Random Forest miRNA Feature Importance",
+    subtitle = sprintf("Ranked by %s", rf_final_importance_miRNA$importance_metric[[1]]),
+    x = NULL,
+    y = rf_final_importance_miRNA$importance_metric[[1]],
+    fill = NULL
+  ) +
+  theme_minimal()
+
+rf_feature_importance_plot_file <- file.path("Figures", "random_forest_feature_importance.png")
+
+save_plot(
+  filename = rf_feature_importance_plot_file,
+  plot = rf_feature_importance_plot,
+  width = 8,
+  height = max(5, 0.3 * nrow(rf_feature_importance_plot_data) + 1.5)
+)
+
+cat(
+  sprintf(
+    '<img src="%s" alt="Random Forest Feature Importance" style="width:100%%; max-width:900px;" />\n\n',
+    rf_feature_importance_plot_file
+  )
+)
+
+```
+
+### Decision Tree Feature Importance
+For the decision tree, we define selected miRNA as miRNA that appear in one or more primary splits of the final fitted tree, and we separately report the tree's variable-importance ranking.
+
+```{r decision_tree_feature_importance, echo=FALSE, results='asis', fig.width=8, fig.height=6}
+
+dt_final_importance <- final_model_outputs[["decision_tree"]]$feature_importance
+dt_final_importance_miRNA <- dt_final_importance %>%
+  filter(.data$variable_type == "miRNA")
+
+write.csv(
+  dt_final_importance,
+  "Tables/Decision Tree Feature Importance.csv",
+  row.names = FALSE
+)
+
+if (!nrow(dt_final_importance_miRNA)) {
+  cat("<p>The final decision tree did not return any miRNA used in primary splits or any miRNA with nonzero importance.</p>\n")
+} else {
+  dt_final_selected_miRNA <- dt_final_importance_miRNA %>%
+    filter(.data$selected_for_final)
+
+  dt_importance_rows_to_show <- min(
+    dt_importance_plot_top_n,
+    nrow(dt_final_importance_miRNA)
+  )
+
+  write.csv(
+    dt_final_selected_miRNA,
+    "Tables/Decision Tree Split Selected miRNA.csv",
+    row.names = FALSE
+  )
+
+  cat(
+    paste0(
+      "<p>For the decision tree, miRNA were considered selected only if they appeared in one or more primary splits of the final tree. ",
+      "The ranking below summarizes each miRNA's total loss reduction across the fitted tree and distinguishes miRNA used in primary splits from miRNA with nonzero importance only.</p>\n"
+    )
+  )
+
+  dt_feature_importance_table <- dt_final_importance_miRNA %>%
+    slice_head(n = dt_importance_rows_to_show) %>%
+    mutate(selected_for_final = if_else(.data$selected_for_final, "Yes", "No")) %>%
+    dplyr::select(
+      importance_rank,
+      variable,
+      importance_value,
+      primary_split_count,
+      selected_for_final
+    )
+
+  render_html_table(
+    dt_feature_importance_table,
+    caption = "Decision-tree miRNA feature-importance ranking on the final holdout model",
+    digits = 3
+  )
+
+  dt_feature_importance_plot_data <- dt_final_importance_miRNA %>%
+    slice_head(n = dt_importance_rows_to_show) %>%
+    mutate(
+      selected_for_final = if_else(.data$selected_for_final, "Used in tree", "Importance only"),
+      variable = factor(.data$variable, levels = rev(.data$variable))
+    )
+
+  dt_feature_importance_plot <- ggplot(
+    dt_feature_importance_plot_data,
+    aes(x = .data$variable, y = .data$importance_value, fill = .data$selected_for_final)
+  ) +
+    geom_col() +
+    coord_flip() +
+    scale_fill_manual(values = c("Used in tree" = "#2C7FB8", "Importance only" = "#B7D4E8")) +
+    labs(
+      title = "Decision Tree miRNA Feature Importance",
+      subtitle = "Ranked by total loss reduction in the final fitted tree",
+      x = NULL,
+      y = "TotalLossReduction",
+      fill = NULL
+    ) +
+    theme_minimal()
+
+  dt_feature_importance_plot_file <- file.path("Figures", "decision_tree_feature_importance.png")
+
+  save_plot(
+    filename = dt_feature_importance_plot_file,
+    plot = dt_feature_importance_plot,
+    width = 8,
+    height = max(5, 0.3 * nrow(dt_feature_importance_plot_data) + 1.5)
+  )
+
+  cat(
+    sprintf(
+      '<img src="%s" alt="Decision Tree Feature Importance" style="width:100%%; max-width:900px;" />\n\n',
+      dt_feature_importance_plot_file
+    )
+  )
+}
+
+```
+
 ## Calibration Curves and Additional Metrics
 Reliability diagrams (calibration curves) and Brier scores for each model on the holdout set
 
@@ -1214,13 +1427,13 @@ cat(
 
 # Selected miRNA Features and Interpretation
 
-## Final selected miRNA across all models
+## Final selected miRNA across non-tree models
 
 ```{r final_selected_miRNA, echo=FALSE, results='asis'}
 
-# final feature counts across all models:
-# create a table of all miRNA features selected by any final model, with a count of how many models selected each feature, sorted by count and then alphabetically
-final_selected_miRNA <- bind_rows(lapply(model_names, function(model_name) {
+# final feature counts across the non-tree models:
+# create a table of all miRNA features selected by any non-tree final model, with a count of how many non-tree models selected each feature, sorted by count and then alphabetically
+final_selected_miRNA <- bind_rows(lapply(consensus_model_names, function(model_name) {
   model_selected <- final_model_outputs[[model_name]]$selected_miRNA
 
   if (is.null(model_selected) || !length(model_selected)) {
@@ -1247,11 +1460,11 @@ write.csv(final_model_feature_counts, "Tables/Final Model Feature Counts.csv", r
 
 render_html_table(
   final_model_feature_counts,
-  caption = "Counts of models selecting each miRNA"
+  caption = "Counts of non-tree models selecting each miRNA"
 )
 
 if (nrow(final_model_feature_counts) == 0) {
-  stop("No miRNAs were selected by any final model.", call. = TRUE)
+  stop("No miRNAs were selected by any non-tree final model.", call. = TRUE)
 }
 
 final_filter_stats <- final_filter_results$stats
@@ -1295,8 +1508,8 @@ cat(
   "<p>Top-rank selection count: ",
   top_rank_count,
   " of ",
-  length(model_names),
-  " models</p>\n",
+  length(consensus_model_names),
+  " non-tree models</p>\n",
   sep = ""
 )
 
@@ -1311,20 +1524,20 @@ render_html_table(
       limma_p_value,
       limma_adj_p_value
     ),
-  caption = "Top-ranked consensus miRNAs"
+  caption = "Top-ranked consensus miRNAs from the non-tree models"
 )
 
 cat(
   "<p>Downstream multiMiR analysis uses all ",
   nrow(top_ranked_miRNA_details),
-  " miRNAs in this top-ranked consensus set.</p>\n",
+  " miRNAs in this non-tree consensus set.</p>\n",
   sep = ""
 )
 
 if (nrow(top_ranked_miRNA_details) > 1) {
   cat(
     paste0(
-      "<p>Multiple miRNAs tied for the highest model-selection count, ",
+      "<p>Multiple miRNAs tied for the highest non-tree model-selection count, ",
       "so the table below is ordered by the smallest blocked-limma p-value, ",
       "with ties broken by the absolute moderated t-statistic and then miRNA identifier. ",
       "All rows in this table are used for downstream multiMiR annotation.</p>\n"
@@ -1334,12 +1547,12 @@ if (nrow(top_ranked_miRNA_details) > 1) {
 
 ```
 
-## Final selected variables across all models
+## Final selected variables across non-tree models
 ```{r final_selected_variables, echo=FALSE, results='asis'}
 
-# final feature counts across all models:
-# create a table of all features selected by any final model, with a count of how many models selected each feature, sorted by count and then alphabetically
-final_selected_variables <- bind_rows(lapply(model_names, function(model_name) {
+# final feature counts across the non-tree models:
+# create a table of all features selected by any non-tree final model, with a count of how many non-tree models selected each feature, sorted by count and then alphabetically
+final_selected_variables <- bind_rows(lapply(consensus_model_names, function(model_name) {
   model_selected <- final_model_outputs[[model_name]]$selected_variables
 
   if (is.null(model_selected) || !length(model_selected)) {
@@ -1369,11 +1582,11 @@ write.csv(final_model_variable_counts, "Tables/Final Variable Counts.csv", row.n
 
 render_html_table(
   final_model_variable_counts,
-  caption = "Counts of models selecting each variable"
+  caption = "Counts of non-tree models selecting each variable"
 )
 
 if (nrow(final_model_variable_counts) == 0) {
-  stop("No variables were selected by any final model.", call. = TRUE)
+  stop("No variables were selected by any non-tree final model.", call. = TRUE)
 }
 
 final_filter_stats <- final_filter_results$stats
@@ -1430,8 +1643,8 @@ cat(
   "<p>Top-rank selection count: ",
   top_rank_count,
   " of ",
-  length(model_names),
-  " models</p>\n",
+  length(consensus_model_names),
+  " non-tree models</p>\n",
   sep = ""
 )
 
@@ -1447,13 +1660,13 @@ render_html_table(
       limma_p_value,
       limma_adj_p_value
     ),
-  caption = "Top-ranked consensus variables"
+  caption = "Top-ranked consensus variables from the non-tree models"
 )
 
 if (nrow(top_ranked_variable_details) > 1) {
   cat(
     paste0(
-      "<p>Multiple variables tied for the highest model-selection count, ",
+      "<p>Multiple variables tied for the highest non-tree model-selection count, ",
       "so miRNA variables in the table below are ordered by the smallest blocked-limma p-value, ",
       "with ties broken by the absolute moderated t-statistic and then variable identifier. ",
       "Demographic covariates do not have blocked-limma statistics and are listed after miRNA variables. ",
@@ -1462,6 +1675,30 @@ if (nrow(top_ranked_variable_details) > 1) {
   )
 }
 
+```
+
+## Comparison of Top-Ranked miRNA by Decision Tree and Random Forest
+```{r comparison_tree_features, fig.height=6, fig.width=8}
+decision_tree_top_miRNA <- decision_tree_results$selected_miRNA
+random_forest_top_miRNA <- final_model_variable_counts %>%
+  filter(variable_type == "miRNA") %>%
+  slice_max(order_by = n_models_selected, n = 1, with_ties = TRUE) %>%
+  pull(variable)
+
+comparison_df <- tibble(
+  miRNA = union(decision_tree_top_miRNA, random_forest_top_miRNA),
+  Decision_Tree = miRNA %in% decision_tree_top_miRNA,
+  Random_Forest = miRNA %in% random_forest_top_miRNA
+)
+
+comparison_df_long <- comparison_df %>%
+  pivot_longer(cols = c("Decision_Tree", "Random_Forest"), names_to = "Model", values_to = "Selected")
+
+ggplot(comparison_df_long, aes(x = Model, y = miRNA, fill = Selected)) +
+  geom_tile(color = "white") +
+  scale_fill_manual(values = c("TRUE" = "steelblue", "FALSE" = "grey90")) +
+  theme_minimal() +
+  labs(title = "Comparison of Top-Ranked miRNA by Decision Tree and Random Forest", x = "Model", y = "miRNA")
 ```
 
 ## miRNA Interactions
