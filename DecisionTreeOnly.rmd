@@ -1,0 +1,151 @@
+---
+title: "Final Project - Predicting PDAC with Circulating miRNA - Decision Tree Only"
+authors: "Madison Blake, Kristyn Gumpper-Fedus, Sean Kirkpatrick"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Predicting PDAC with Circulating miRNA - Decision Tree Only
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE
+)
+
+dir.create("Data", showWarnings = FALSE, recursive = TRUE)
+
+source("R/model_only_report_helpers.R")
+source("R/run_fold_dt.R")
+source("R/run_limma_paired.R")
+source("R/differential_expression_filter_fn.R")
+```
+
+```{r constants, include=FALSE}
+set.seed(31415)
+
+normalized_data_file <- "Data/GSE314577/GSE314577_VUMC_miRNA_normalized_data.xlsx"
+metadata_file <- "Data/GSE314577/GSE314577_VUMC_Metadata_ch_revised.xlsx"
+limma_rds_file <- "Data/Full train_filter_results.rds"
+
+log2_pseudocount <- 1
+run_limma_analysis <- FALSE
+train_fraction <- 0.8
+k <- 10
+
+fold_filter_top_n <- 25
+tree_model_feature_multiplier <- 4L
+# dt_feature_pool_top_n <- fold_filter_top_n * tree_model_feature_multiplier
+dt_feature_pool_top_n <- length(train_filter_results$stats$miRNA)
+dt_cp <- 0.001
+dt_maxdepth <- 30
+
+demographic_covariates <- c("Sex", "Race", "Age")
+factor_demographic_covariates <- c("Sex", "Race")
+use_model_covariates <- TRUE
+model_covariates <- if (use_model_covariates) demographic_covariates else character(0)
+
+limma_group_term <- "CC"
+limma_adjustment_covariates <- demographic_covariates
+filter_stat_cols <- c(
+  "miRNA",
+  "mean_control",
+  "mean_case",
+  "mean_diff",
+  "limma_log_fc",
+  "limma_avg_expr",
+  "limma_t",
+  "limma_p_value",
+  "limma_adj_p_value",
+  "limma_b"
+)
+```
+
+```{r shared_inputs, include=FALSE}
+analysis_inputs <- load_model_only_pipeline_data(
+  normalized_data_file = normalized_data_file,
+  metadata_file = metadata_file,
+  log2_pseudocount = log2_pseudocount,
+  train_fraction = train_fraction,
+  run_limma_analysis = run_limma_analysis,
+  limma_rds_file = limma_rds_file,
+  filter_stat_cols = filter_stat_cols,
+  fold_filter_top_n = fold_filter_top_n,
+  limma_group_term = limma_group_term,
+  limma_adjustment_covariates = limma_adjustment_covariates
+)
+
+train_set <- analysis_inputs$train_set
+holdout <- analysis_inputs$holdout
+train_filter_results <- analysis_inputs$train_filter_results
+```
+
+```{r model_feature_pool, include=FALSE}
+selected_miRNA <- select_top_limma_miRNA(
+  train_filter_results$stats,
+  top_n = dt_feature_pool_top_n
+)$miRNA
+```
+
+```{r model_run, include=FALSE}
+model_runner <- function(fold_inputs) {
+  run_fold_dt(
+    fold_inputs,
+    cp_dt = dt_cp,
+    maxdepth = dt_maxdepth
+  )
+}
+
+cv_results <- run_single_model_cv(
+  train_set = train_set,
+  k = k,
+  selected_miRNA = selected_miRNA,
+  model_name = "decision_tree",
+  model_runner = model_runner,
+  model_covariates = model_covariates,
+  factor_model_covariates = factor_demographic_covariates
+)
+
+holdout_results <- run_single_model_holdout(
+  train_set = train_set,
+  holdout = holdout,
+  selected_miRNA = selected_miRNA,
+  model_name = "decision_tree",
+  model_runner = model_runner,
+  model_covariates = model_covariates,
+  factor_model_covariates = factor_demographic_covariates
+)
+```
+
+```{r final_objects, include=FALSE}
+decision_tree_results <- list(
+  train_filter_results = train_filter_results,
+  selected_miRNA = selected_miRNA,
+  cv_predictions = cv_results$cv_predictions,
+  cv_tuning = cv_results$cv_tuning,
+  cv_feature_counts = cv_results$cv_feature_counts,
+  cv_preselected_feature_counts = cv_results$cv_preselected_feature_counts,
+  cv_selected_variables = cv_results$cv_selected_variables,
+  cv_selected_miRNA = cv_results$cv_selected_miRNA,
+  cv_summary = cv_results$cv_summary,
+  holdout_roc = holdout_results$holdout_roc,
+  holdout_predictions = holdout_results$holdout_predictions,
+  holdout_summary = holdout_results$holdout_summary,
+  final_fold_inputs = holdout_results$final_fold_inputs,
+  final_model_output = holdout_results$final_model_output
+)
+```
+
+## Holdout ROC Curve
+
+```{r holdout_roc_plot, echo=FALSE, fig.width=6, fig.height=6}
+plot_model_roc_curve(
+  holdout_results$holdout_predictions,
+  model_label = "Decision Tree",
+  dataset_label = "Holdout"
+)
+```
+
+```{r}
+```
