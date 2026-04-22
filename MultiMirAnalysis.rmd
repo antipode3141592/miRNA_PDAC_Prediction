@@ -1,0 +1,650 @@
+---
+title: "Final Project - Predicting PDAC with Circulating miRNA - Multi-miRNA and Consensus Feature Analysis"
+authors: "Madison Blake, Kristyn Gumpper-Fedus, Sean Kirkpatrick"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(
+	echo = FALSE,
+	message = FALSE,
+	warning = FALSE,
+	dev = "png",
+	fig.path = "Figures/",
+	fig.retina = 1
+)
+
+dir.create("Data", showWarnings = FALSE, recursive = TRUE)
+dir.create("Tables", showWarnings = FALSE, recursive = TRUE)
+dir.create("Figures", showWarnings = FALSE, recursive = TRUE)
+
+library(dplyr)
+library(ggplot2)
+library(readr)
+
+source("R/plotHelpers.R")
+source("R/multi_mir_analysis.R")
+
+report_start_time <- Sys.time()
+
+write_comma_separated_list <- function(items) {
+	if (length(items) == 0) {
+		return("")
+	} else if (length(items) == 1) {
+		return(items)
+	} else {
+		return(paste(
+			paste(items[-length(items)], collapse = ", "),
+			items[length(items)],
+			sep = ifelse(length(items) > 2, ", and ", " and ")
+		))
+	}
+}
+
+first_non_missing <- function(values) {
+	values <- values[!is.na(values) & values != ""]
+
+	if (length(values)) {
+		values[[1]]
+	} else {
+		NA_character_
+	}
+}
+
+```
+
+```{r report_table_styles, echo=FALSE, results='asis'}
+
+cat(
+	paste(
+		"<style>",
+		"table {",
+		"  border-collapse: collapse;",
+		"}",
+		"table th,",
+		"table td {",
+		"  border: 1px solid #cfcfcf;",
+		"  padding: 4px 8px;",
+		"}",
+		"</style>",
+		sep = "\n"
+	)
+)
+
+```
+
+```{r constants, include=FALSE}
+
+gene_family_file <- "Data/GSE314577_family.xml/GPL30934-tbl-1.txt"
+downstream_analysis_inputs_rds_file <- "Data/Top-ranked consensus miRNA downstream inputs.rds"
+run_multimir_analysis <- TRUE
+multimir_results_rds_file <- "Data/Top-ranked consensus miRNA multiMiR results.rds"
+
+```
+
+```{r load_downstream_inputs, include=FALSE}
+
+if (!file.exists(downstream_analysis_inputs_rds_file)) {
+	stop(
+		paste(
+			"Downstream analysis input file not found:",
+			downstream_analysis_inputs_rds_file,
+			"Run PDACmiRNAAnalysis.rmd first to generate the saved consensus-feature inputs."
+		),
+		call. = TRUE
+	)
+}
+
+downstream_analysis_inputs <- readRDS(downstream_analysis_inputs_rds_file)
+required_input_names <- c("top_ranked_miRNA_details", "merged_top_features")
+missing_input_names <- setdiff(required_input_names, names(downstream_analysis_inputs))
+
+if (length(missing_input_names) > 0) {
+	stop(
+		paste(
+			"Downstream analysis input file is missing required objects:",
+			paste(missing_input_names, collapse = ", ")
+		),
+		call. = TRUE
+	)
+}
+
+top_ranked_miRNA_details <- downstream_analysis_inputs$top_ranked_miRNA_details
+merged_top_features <- unique(as.character(downstream_analysis_inputs$merged_top_features))
+
+if (!is.data.frame(top_ranked_miRNA_details) || nrow(top_ranked_miRNA_details) == 0) {
+	stop("Saved top_ranked_miRNA_details is missing or empty.", call. = TRUE)
+}
+
+if (!length(merged_top_features)) {
+	stop("Saved merged_top_features is missing or empty.", call. = TRUE)
+}
+
+gpl <- read_tsv(
+	gene_family_file,
+	col_names = c("Annotation", "Alias", "MIMAT", "ClassName"),
+	show_col_types = FALSE
+)
+
+annotation_lookup <- gpl %>%
+	distinct(.data$MIMAT, .keep_all = TRUE) %>%
+	transmute(
+		miRNA = .data$MIMAT,
+		Annotation = .data$Annotation
+	)
+
+merged_top_feature_details <- data.frame(
+	miRNA = merged_top_features,
+	n_models_selected = 1L,
+	stringsAsFactors = FALSE
+) %>%
+	left_join(annotation_lookup, by = "miRNA")
+
+merged_top_feature_details$multiMiR_query_id <- vapply(
+	merged_top_feature_details$Annotation,
+	FUN.VALUE = character(1),
+	function(annotation_value) {
+		if (is.na(annotation_value) || !nzchar(annotation_value)) {
+			return(NA_character_)
+		}
+
+		trimws(strsplit(annotation_value, ",", fixed = TRUE)[[1]][[1]])
+	}
+)
+
+write.csv(
+	top_ranked_miRNA_details,
+	"Tables/Top-ranked Consensus miRNA Details.csv",
+	row.names = FALSE
+)
+
+write.csv(
+	merged_top_feature_details,
+	"Tables/Merged Top miRNA Features for Downstream multiMiR Queries.csv",
+	row.names = FALSE
+)
+
+top_rank_count <- suppressWarnings(max(top_ranked_miRNA_details$n_models_selected, na.rm = TRUE))
+
+if (!is.finite(top_rank_count)) {
+	top_rank_count <- 0L
+}
+
+```
+
+# Multi-miRNA and Consensus Feature Analysis
+
+This report loads the saved consensus-feature inputs written by the main PDAC modeling report and performs the downstream multiMiR and final consensus-feature summary analysis separately.
+
+## Top-ranked Consensus miRNAs
+
+```{r top_ranked_consensus_mirna, results='asis'}
+
+cat(
+	"<p>Loaded downstream consensus-feature inputs from ",
+	downstream_analysis_inputs_rds_file,
+	". Top-rank selection count: ",
+	top_rank_count,
+	" non-tree models.</p>\n",
+	sep = ""
+)
+
+render_html_table(
+	top_ranked_miRNA_details %>%
+		dplyr::select(
+			miRNA,
+			Annotation,
+			n_models_selected,
+			limma_log_fc,
+			limma_t,
+			limma_p_value,
+			limma_adj_p_value
+		),
+	caption = "Top-ranked consensus miRNAs from the non-tree models"
+)
+
+if (nrow(top_ranked_miRNA_details) > 1) {
+	cat(
+		paste0(
+			"<p>Multiple miRNAs tied for the highest non-tree model-selection count, ",
+			"so the table is ordered by the smallest blocked-limma p-value, ",
+			"with ties broken by the absolute moderated t-statistic and then miRNA identifier. ",
+			"All rows in this table feed the downstream consensus-feature summary outputs.</p>\n"
+		)
+	)
+}
+
+```
+
+## Merged miRNA Set for Downstream multiMiR Queries
+
+```{r merged_top_feature_inputs, results='asis'}
+
+cat(
+	"<p>The downstream multiMiR query set contains ",
+	nrow(merged_top_feature_details),
+	" merged top miRNA features drawn from the consensus, decision-tree, and random-forest rankings.</p>\n",
+	sep = ""
+)
+
+render_html_table(
+	merged_top_feature_details %>%
+		dplyr::select(
+			miRNA,
+			Annotation,
+			multiMiR_query_id
+		),
+	caption = "Merged top miRNA features with derived multiMiR query identifiers"
+)
+
+```
+
+## miRNA Interactions
+
+Assess validated target and disease/drug associations for the merged top-ranked miRNA set with multiMiR.
+
+```{r multi_mir_analysis, results='asis'}
+
+if (run_multimir_analysis) {
+	multimir_results <- run_multi_mir_queries(merged_top_feature_details)
+	saveRDS(multimir_results, multimir_results_rds_file)
+} else {
+	if (!file.exists(multimir_results_rds_file)) {
+		stop(
+			paste(
+				"Saved multiMiR results file not found:",
+				multimir_results_rds_file,
+				"Set run_multimir_analysis <- TRUE to refresh the downstream multiMiR results."
+			),
+			call. = TRUE
+		)
+	}
+
+	multimir_results <- readRDS(multimir_results_rds_file)
+
+	cat(
+		"<p>Loaded saved multiMiR results from ",
+		multimir_results_rds_file,
+		" instead of issuing live multiMiR queries.</p>\n",
+		sep = ""
+	)
+}
+
+if (nrow(multimir_results$query_failures) > 0) {
+	cat(
+		"<p>",
+		nrow(multimir_results$query_failures),
+		" multiMiR query call",
+		if (nrow(multimir_results$query_failures) == 1) " was" else "s were",
+		" skipped after returning an error. The report will continue with any successful multiMiR results.</p>\n",
+		sep = ""
+	)
+}
+
+if (nrow(multimir_results$queried_miRNA) == 0) {
+	cat("<p>No valid miRNA annotation was available for the merged top-feature set, so multiMiR queries were skipped.</p>\n")
+} else {
+	cat(
+		"<p>multiMiR query miRNAs: ",
+		write_comma_separated_list(multimir_results$queried_miRNA$multiMiR_query_id),
+		"</p>\n",
+		sep = ""
+	)
+
+	if (multimir_results$skipped_query_count > 0) {
+		cat(
+			"<p>",
+			multimir_results$skipped_query_count,
+			" merged top-feature miRNA",
+			if (multimir_results$skipped_query_count == 1) " was" else "s were",
+			" skipped because no valid multiMiR query identifier was available.</p>\n",
+			sep = ""
+		)
+	}
+
+	validated_target_summary <- multimir_results$validated$summary
+
+	if (!is.null(validated_target_summary) && nrow(validated_target_summary) > 0) {
+		write.csv(
+			validated_target_summary,
+			"Tables/Top-ranked Consensus miRNA multiMiR Validated Targets.csv",
+			row.names = FALSE
+		)
+
+		unique_validated_targets <- unique(
+			validated_target_summary$target_symbol[
+				!is.na(validated_target_summary$target_symbol) &
+					validated_target_summary$target_symbol != ""
+			]
+		)
+
+		cat(
+			"<p>Validated multiMiR interaction records across the merged top-feature miRNA set: ",
+			multimir_results$validated$total_record_count,
+			"; unique target genes: ",
+			length(unique_validated_targets),
+			"; queried miRNAs with validated targets: ",
+			length(unique(validated_target_summary$miRNA)),
+			" of ",
+			nrow(multimir_results$queried_miRNA),
+			"</p>\n",
+			sep = ""
+		)
+
+		render_html_table(
+			utils::head(validated_target_summary, 15),
+			caption = "Top validated multiMiR targets for the merged top-feature miRNA set"
+		)
+	} else {
+		cat("<p>No validated multiMiR target interactions were returned for the merged top-feature miRNA set.</p>\n")
+	}
+
+	disease_association_summary <- multimir_results$disease_drug$summary
+
+	if (!is.null(disease_association_summary) && nrow(disease_association_summary) > 0) {
+		write.csv(
+			disease_association_summary,
+			"Tables/Top-ranked Consensus miRNA multiMiR Disease-Drug Associations.csv",
+			row.names = FALSE
+		)
+
+		unique_association_terms <- unique(
+			disease_association_summary$disease_drug[
+				!is.na(disease_association_summary$disease_drug) &
+					disease_association_summary$disease_drug != ""
+			]
+		)
+
+		cat(
+			"<p>multiMiR disease/drug association records across the merged top-feature miRNA set: ",
+			multimir_results$disease_drug$total_record_count,
+			"; unique association terms: ",
+			length(unique_association_terms),
+			"; queried miRNAs with disease/drug associations: ",
+			length(unique(disease_association_summary$miRNA)),
+			" of ",
+			nrow(multimir_results$queried_miRNA),
+			"</p>\n",
+			sep = ""
+		)
+
+		render_html_table(
+			utils::head(disease_association_summary, 15),
+			caption = "Top multiMiR disease/drug associations for the merged top-feature miRNA set"
+		)
+	} else {
+		cat("<p>No multiMiR disease/drug associations were returned for the merged top-feature miRNA set.</p>\n")
+	}
+}
+
+```
+
+## Shared Validated multiMiR Target Genes
+
+Summarize validated target genes across the saved multiMiR results object for the merged top-feature miRNA set.
+
+```{r multimir_gene_summary, results='asis'}
+
+multimir_gene_summary <- NULL
+
+validated_target_summary <- multimir_results$validated$summary
+
+if (is.null(validated_target_summary) || nrow(validated_target_summary) == 0) {
+	cat(
+		"<p>The saved multiMiR results did not contain any validated target summary rows.</p>\n"
+	)
+} else {
+	multimir_gene_summary <- validated_target_summary %>%
+		mutate(
+			miRNA_label = if_else(
+				!is.na(.data$Annotation) & .data$Annotation != "",
+				.data$Annotation,
+				.data$miRNA
+			)
+		) %>%
+		group_by(.data$target_symbol) %>%
+		summarise(
+			target_entrez = first_non_missing(.data$target_entrez),
+			target_ensembl = first_non_missing(.data$target_ensembl),
+			n_consensus_miRNA = n_distinct(.data$miRNA),
+			consensus_miRNA = write_comma_separated_list(sort(unique(.data$miRNA_label))),
+			total_validated_support = sum(.data$validated_support, na.rm = TRUE),
+			total_support = sum(.data$total_support, na.rm = TRUE),
+			max_models_selected = max(.data$n_models_selected, na.rm = TRUE),
+			.groups = "drop"
+		) %>%
+		arrange(
+			desc(.data$n_consensus_miRNA),
+			desc(.data$total_validated_support),
+			desc(.data$total_support),
+			.data$target_symbol
+		)
+
+	write.csv(
+		multimir_gene_summary,
+		"Tables/Top-ranked Consensus miRNA multiMiR Target Gene Summary.csv",
+		row.names = FALSE
+	)
+
+	cat(
+		"<p>Loaded saved multiMiR results from ",
+		multimir_results_rds_file,
+		" and summarized ",
+		nrow(multimir_gene_summary),
+		" validated target genes across ",
+		nrow(multimir_results$queried_miRNA),
+		" queried merged top-feature miRNAs.</p>\n",
+		sep = ""
+	)
+
+	render_html_table(
+		utils::head(multimir_gene_summary, 20),
+		caption = "Validated target genes shared across the merged top-feature miRNA set"
+	)
+}
+
+```
+
+## Shared multiMiR Disease/Drug Terms
+
+Summarize disease/drug terms across the saved multiMiR results object for the merged top-feature miRNA set.
+
+```{r multimir_disease_drug_top_terms, results='asis'}
+
+disease_association_summary <- multimir_results$disease_drug$summary
+
+if (is.null(disease_association_summary) || nrow(disease_association_summary) == 0) {
+	cat(
+		"<p>The saved multiMiR results did not contain any disease/drug association summary rows.</p>\n"
+	)
+} else {
+	multimir_disease_drug_summary <- disease_association_summary %>%
+		mutate(
+			miRNA_label = if_else(
+				!is.na(.data$Annotation) & .data$Annotation != "",
+				.data$Annotation,
+				.data$miRNA
+			),
+			disease_drug = trimws(.data$disease_drug)
+		) %>%
+		filter(!is.na(.data$disease_drug), .data$disease_drug != "") %>%
+		group_by(.data$disease_drug) %>%
+		summarise(
+			n_consensus_miRNA = n_distinct(.data$miRNA),
+			consensus_miRNA = write_comma_separated_list(sort(unique(.data$miRNA_label))),
+			total_records = sum(.data$n_records, na.rm = TRUE),
+			total_databases = sum(.data$n_databases, na.rm = TRUE),
+			total_pubmed = sum(.data$n_pubmed, na.rm = TRUE),
+			max_models_selected = max(.data$n_models_selected, na.rm = TRUE),
+			.groups = "drop"
+		) %>%
+		arrange(
+			desc(.data$n_consensus_miRNA),
+			desc(.data$total_records),
+			desc(.data$total_pubmed),
+			.data$disease_drug
+		)
+
+	write.csv(
+		multimir_disease_drug_summary,
+		"Tables/Top-ranked Consensus miRNA multiMiR Disease-Drug Term Summary.csv",
+		row.names = FALSE
+	)
+
+	cat(
+		"<p>Loaded saved multiMiR results from ",
+		multimir_results_rds_file,
+		" and summarized ",
+		nrow(multimir_disease_drug_summary),
+		" disease/drug terms across ",
+		nrow(multimir_results$queried_miRNA),
+		" queried merged top-feature miRNAs.</p>\n",
+		sep = ""
+	)
+
+	render_html_table(
+		multimir_disease_drug_summary,
+		caption = "Disease/drug terms shared across the merged top-feature miRNA set"
+	)
+}
+
+```
+
+# Final Summary Table of the Top-Ranked Consensus miRNAs
+
+A table of the top-ranked consensus miRNAs with their blocked-limma statistics, model selection counts, and multiMiR summary counts.
+
+```{r summary_table_consensus_features, results='asis'}
+
+validated_target_counts <- data.frame(
+	miRNA = character(0),
+	n_target_genes = integer(0),
+	stringsAsFactors = FALSE
+)
+
+if (!is.null(multimir_results$validated$summary) && nrow(multimir_results$validated$summary) > 0) {
+	validated_target_counts <- multimir_results$validated$summary %>%
+		filter(!is.na(.data$target_symbol) & .data$target_symbol != "") %>%
+		group_by(.data$miRNA) %>%
+		summarise(
+			n_target_genes = n_distinct(.data$target_symbol),
+			.groups = "drop"
+		)
+}
+
+disease_drug_counts <- data.frame(
+	miRNA = character(0),
+	n_disease_drug_terms = integer(0),
+	stringsAsFactors = FALSE
+)
+
+if (!is.null(multimir_results$disease_drug$summary) && nrow(multimir_results$disease_drug$summary) > 0) {
+	disease_drug_counts <- multimir_results$disease_drug$summary %>%
+		filter(!is.na(.data$disease_drug) & .data$disease_drug != "") %>%
+		group_by(.data$miRNA) %>%
+		summarise(
+			n_disease_drug_terms = n_distinct(.data$disease_drug),
+			.groups = "drop"
+		)
+}
+
+final_feature_table <- top_ranked_miRNA_details %>%
+	dplyr::select(
+		miRNA,
+		Annotation,
+		mean_control,
+		mean_case,
+		mean_diff,
+		limma_p_value,
+		n_models_selected
+	) %>%
+	left_join(validated_target_counts, by = "miRNA") %>%
+	left_join(disease_drug_counts, by = "miRNA") %>%
+	mutate(
+		n_target_genes = dplyr::coalesce(.data$n_target_genes, 0L),
+		n_disease_drug_terms = dplyr::coalesce(.data$n_disease_drug_terms, 0L)
+	)
+
+write.csv(final_feature_table, "Tables/Summary of Consensus miRNAs.csv", row.names = FALSE)
+
+render_html_table(
+	final_feature_table,
+	caption = "Top-ranked consensus miRNAs summary",
+	digits = 3
+)
+
+```
+
+## Blocked-limma Summary Plot of Top-Ranked Consensus miRNAs
+
+Blocked-limma summary of the top-ranked consensus miRNAs.
+
+```{r final_limma_summary_plot, results='asis', fig.width=7, fig.height=5}
+
+limma_plot_data <- top_ranked_miRNA_details %>%
+	mutate(
+		plot_p_value = pmax(.data$limma_p_value, .Machine$double.xmin),
+		plot_label = if_else(!is.na(.data$Annotation) & .data$Annotation != "", .data$Annotation, .data$miRNA)
+	)
+
+limma_summary_plot <- ggplot(
+	limma_plot_data,
+	aes(x = limma_log_fc, y = -log10(plot_p_value), color = limma_t)
+) +
+	geom_point(size = 3) +
+	geom_text(aes(label = plot_label), nudge_y = 0.1, check_overlap = TRUE, size = 3) +
+	scale_color_gradient2(low = "blue", mid = "grey90", high = "red", midpoint = 0, na.value = "grey") +
+	labs(
+		title = "Blocked-limma Summary of Top-Ranked Consensus miRNAs",
+		x = "Limma logFC",
+		y = "-Log10 limma P-Value",
+		color = "Limma t"
+	) +
+	theme_minimal()
+
+association_plot_file <- "Figures/Blocked Limma Summary Top Consensus miRNAs.png"
+
+save_plot(
+	filename = association_plot_file,
+	plot = limma_summary_plot
+)
+
+cat(
+	sprintf(
+		'<img src="%s" alt="Blocked-limma Summary of Top-Ranked Consensus miRNAs" style="width:100%%; max-width:700px;" />\n\n',
+		association_plot_file
+	)
+)
+
+```
+
+```{r final_report_conclusion, results='asis'}
+
+report_end_time <- Sys.time()
+elapsed_seconds <- as.numeric(difftime(report_end_time, report_start_time, units = "secs"))
+
+format_elapsed_time <- function(elapsed_seconds) {
+	total_seconds <- max(0L, as.integer(round(elapsed_seconds)))
+	hours <- total_seconds %/% 3600L
+	minutes <- (total_seconds %% 3600L) %/% 60L
+	seconds <- total_seconds %% 60L
+
+	sprintf("%02d:%02d:%02d", hours, minutes, seconds)
+}
+
+cat(
+	paste0(
+		"<p>Report runtime: ",
+		format_elapsed_time(elapsed_seconds),
+		" (started ",
+		format(report_start_time, "%Y-%m-%d %H:%M:%S"),
+		"; finished ",
+		format(report_end_time, "%Y-%m-%d %H:%M:%S"),
+		").</p>\n"
+	)
+)
+
+```
+

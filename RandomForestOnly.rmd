@@ -32,12 +32,12 @@ limma_rds_file <- "Data/Full train_filter_results.rds"
 log2_pseudocount <- 1
 run_limma_analysis <- FALSE
 train_fraction <- 0.8
-k <- 10
+k <- 5
 
 fold_filter_top_n <- 25
-rf_ntree <- 500
+rf_ntree <- 5000
 rf_mtry_grid <- c(5L, 10L, 20L, 30L)
-rf_top_m_features <- fold_filter_top_n
+rf_top_m_features <- 10
 rf_importance_metric <- "MeanDecreaseAccuracy"
 rf_importance_plot_top_n <- max(20L, rf_top_m_features)
 
@@ -142,6 +142,67 @@ rf_results <- list(
 )
 ```
 
+## Random Forest Out-of-Bag Error by Tree Count
+
+```{r rf_oob_error_curve, echo=FALSE, results='asis', fig.width=8, fig.height=6}
+rf_final_oob_error_curve <- holdout_results$final_model_output$oob_error_curve
+
+if (is.null(rf_final_oob_error_curve) || !nrow(rf_final_oob_error_curve)) {
+  cat("<p>The final random-forest model did not return OOB error by tree count.</p>\n")
+} else {
+  rf_optimal_ntree <- holdout_results$final_model_output$optimal_ntree
+
+  if (is.null(rf_optimal_ntree) || !length(rf_optimal_ntree) || !is.finite(rf_optimal_ntree)) {
+    rf_optimal_ntree <- rf_final_oob_error_curve$n_trees[[which.min(rf_final_oob_error_curve$oob_error)]]
+  }
+
+  rf_optimal_oob_error <- rf_final_oob_error_curve$oob_error[[
+    match(rf_optimal_ntree, rf_final_oob_error_curve$n_trees)
+  ]]
+  rf_best_mtry <- holdout_results$final_model_output$tuning$mtry[[1]]
+
+  write.csv(
+    rf_final_oob_error_curve,
+    "Tables/Random Forest OOB Error by Tree Count.csv",
+    row.names = FALSE
+  )
+
+  cat(
+    sprintf(
+      "<p>For the best random-forest fit at mtry = %d, the first minimum OOB classification error was %.3f at %d trees, and the final random-forest model was refit using that tree count.</p>\n",
+      rf_best_mtry,
+      rf_optimal_oob_error,
+      rf_optimal_ntree
+    )
+  )
+
+  rf_oob_error_curve_plot <- ggplot2::ggplot(
+    rf_final_oob_error_curve,
+    ggplot2::aes(x = n_trees, y = oob_error)
+  ) +
+    ggplot2::geom_line(color = "#2C7FB8", linewidth = 0.9) +
+    ggplot2::geom_vline(xintercept = rf_optimal_ntree, linetype = "dashed", color = "#C65D3B") +
+    ggplot2::geom_point(
+      data = rf_final_oob_error_curve[
+        rf_final_oob_error_curve$n_trees == rf_optimal_ntree,
+        ,
+        drop = FALSE
+      ],
+      color = "#C65D3B",
+      size = 2.5
+    ) +
+    ggplot2::labs(
+      title = "Random Forest OOB Classification Error by Tree Count",
+      subtitle = sprintf("Best mtry = %d; first minimum at %d trees", rf_best_mtry, rf_optimal_ntree),
+      x = "Number of Trees",
+      y = "Out-of-Bag Classification Error"
+    ) +
+    ggplot2::theme_minimal()
+
+  print(rf_oob_error_curve_plot)
+}
+```
+
 ## Final Random Forest Feature Importance
 
 ```{r rf_feature_importance_table, echo=FALSE, results='asis'}
@@ -204,4 +265,8 @@ plot_model_roc_curve(
   model_label = "Random Forest",
   dataset_label = "Holdout"
 )
+```
+
+```{r}
+
 ```

@@ -38,8 +38,30 @@ run_fold_rf <- function(
   )
 
   best_fit_index <- which.min(oob_error)
-  rf_fit <- rf_fits[[best_fit_index]]
+  rf_search_fit <- rf_fits[[best_fit_index]]
   best_mtry <- candidate_mtry[[best_fit_index]]
+  oob_error_curve <- data.frame(
+    n_trees = seq_len(nrow(rf_search_fit$err.rate)),
+    oob_error = as.numeric(rf_search_fit$err.rate[, "OOB"]),
+    mtry = best_mtry,
+    stringsAsFactors = FALSE,
+    check.names = FALSE
+  )
+  optimal_ntree <- oob_error_curve$n_trees[[which.min(oob_error_curve$oob_error)]]
+
+  rf_fit <- if (optimal_ntree < ntree) {
+    randomForest::randomForest(
+      fold_inputs$class_formula,
+      data = fold_inputs$train_design_dat,
+      ntree = optimal_ntree,
+      mtry = best_mtry,
+      importance = TRUE
+    )
+  } else {
+    rf_search_fit
+  }
+
+  final_oob_error <- as.numeric(utils::tail(rf_fit$err.rate[, "OOB"], n = 1))
 
   importance_matrix <- randomForest::importance(rf_fit, scale = FALSE)
   feature_importance <- if (is.null(dim(importance_matrix))) {
@@ -151,13 +173,18 @@ run_fold_rf <- function(
     prob = prob,
     selected_variables = selected_variables,
     selected_miRNA = selected_miRNA,
+    oob_error_curve = oob_error_curve,
+    optimal_ntree = optimal_ntree,
     feature_importance = feature_importance,
     tuning = data.frame(
       model = "random_forest",
       n_selected_miRNA = length(selected_miRNA),
-      ntree = ntree,
+      ntree = optimal_ntree,
+      ntree_search_max = ntree,
       mtry = best_mtry,
-      oob_error = oob_error[[best_fit_index]],
+      optimal_ntree = optimal_ntree,
+      oob_error = final_oob_error,
+      oob_error_search_min = min(oob_error_curve$oob_error, na.rm = TRUE),
       importance_metric = importance_metric,
       top_m_features = length(selected_miRNA),
       stringsAsFactors = FALSE

@@ -137,21 +137,100 @@ normalize_disease_drug_data <- function(disease_multimir_data) {
   disease_multimir_data
 }
 
-run_multi_mir_analysis <- function(miRNA_details) {
-  consensus_miRNA_details <- miRNA_details[
-    !duplicated(miRNA_details$miRNA),
+empty_multi_mir_query_details <- function() {
+  data.frame(
+    miRNA = character(0),
+    Annotation = character(0),
+    multiMiR_query_id = character(0),
+    n_models_selected = numeric(0),
+    row.names = NULL,
+    check.names = FALSE,
+    stringsAsFactors = FALSE
+  )
+}
+
+normalize_multi_mir_query_id <- function(miRNA_id, org = "hsa") {
+  query_id <- trimws(miRNA_id)
+
+  if (is.na(query_id) || !nzchar(query_id)) {
+    return(NA_character_)
+  }
+
+  if (grepl("^[[:alpha:]]{3}-(miR|mir|let)-", query_id)) {
+    return(query_id)
+  }
+
+  if (grepl("^(miR|mir|let)-", query_id)) {
+    return(paste0(org, "-", query_id))
+  }
+
+  query_id
+}
+
+build_multi_mir_query_details <- function(miRNA_input, n_models_selected = 1L, org = "hsa") {
+  if (!length(miRNA_input)) {
+    return(empty_multi_mir_query_details())
+  }
+
+  n_models_selected <- rep_len(n_models_selected, length(miRNA_input))
+
+  expanded_inputs <- lapply(seq_along(miRNA_input), function(input_index) {
+    input_value <- miRNA_input[[input_index]]
+
+    if (is.na(input_value) || !nzchar(trimws(input_value))) {
+      return(NULL)
+    }
+
+    input_tokens <- trimws(strsplit(input_value, ",", fixed = TRUE)[[1]])
+    input_tokens <- input_tokens[nzchar(input_tokens)]
+
+    if (!length(input_tokens)) {
+      return(NULL)
+    }
+
+    query_ids <- vapply(
+      input_tokens,
+      normalize_multi_mir_query_id,
+      FUN.VALUE = character(1),
+      org = org
+    )
+
+    data.frame(
+      miRNA = query_ids,
+      Annotation = input_tokens,
+      multiMiR_query_id = query_ids,
+      n_models_selected = rep(n_models_selected[[input_index]], length(input_tokens)),
+      row.names = NULL,
+      check.names = FALSE,
+      stringsAsFactors = FALSE
+    )
+  })
+
+  expanded_inputs <- Filter(Negate(is.null), expanded_inputs)
+
+  if (!length(expanded_inputs)) {
+    return(empty_multi_mir_query_details())
+  }
+
+  query_details <- dplyr::bind_rows(expanded_inputs)
+  query_details <- query_details[
+    !is.na(query_details$multiMiR_query_id) &
+      nzchar(query_details$multiMiR_query_id),
     ,
     drop = FALSE
   ]
-
-  queried_miRNA <- consensus_miRNA_details[
-    !is.na(consensus_miRNA_details$multiMiR_query_id) &
-      nzchar(consensus_miRNA_details$multiMiR_query_id),
+  query_details <- query_details[
+    !duplicated(query_details$multiMiR_query_id),
     ,
     drop = FALSE
   ]
+  row.names(query_details) <- NULL
 
-  multimir_results <- list(
+  query_details
+}
+
+initialize_multi_mir_results <- function(consensus_miRNA_details, queried_miRNA) {
+  list(
     consensus_miRNA = consensus_miRNA_details,
     queried_miRNA = queried_miRNA,
     skipped_query_count = nrow(consensus_miRNA_details) - nrow(queried_miRNA),
@@ -175,6 +254,27 @@ run_multi_mir_analysis <- function(miRNA_details) {
       stringsAsFactors = FALSE,
       check.names = FALSE
     )
+  )
+}
+
+run_multi_mir_queries <- function(queried_miRNA, consensus_miRNA_details = queried_miRNA) {
+  consensus_miRNA_details <- consensus_miRNA_details[
+    !duplicated(consensus_miRNA_details$miRNA),
+    ,
+    drop = FALSE
+  ]
+
+  queried_miRNA <- queried_miRNA[
+    !duplicated(queried_miRNA$miRNA) &
+      !is.na(queried_miRNA$multiMiR_query_id) &
+      nzchar(queried_miRNA$multiMiR_query_id),
+    ,
+    drop = FALSE
+  ]
+
+  multimir_results <- initialize_multi_mir_results(
+    consensus_miRNA_details = consensus_miRNA_details,
+    queried_miRNA = queried_miRNA
   )
 
   if (nrow(queried_miRNA) == 0) {
@@ -328,4 +428,11 @@ run_multi_mir_analysis <- function(miRNA_details) {
   }
 
   multimir_results
+}
+
+run_multi_mir_analysis <- function(miRNA_details) {
+  run_multi_mir_queries(
+    queried_miRNA = miRNA_details,
+    consensus_miRNA_details = miRNA_details
+  )
 }

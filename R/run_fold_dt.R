@@ -6,6 +6,19 @@ run_fold_dt <- function(fold_inputs, cp_dt = 0.001, maxdepth = 20) {
     control = rpart::rpart.control(cp = cp_dt, maxdepth = maxdepth)
   )
 
+  root_class_frequency <- table(fold_inputs$train_design_dat$CC)
+  root_error_rate <- 1 - max(root_class_frequency) / sum(root_class_frequency)
+  cv_classification_error <- data.frame(
+    tree_size = as.integer(dt_fit$cptable[, "nsplit"] + 1L),
+    nsplit = as.integer(dt_fit$cptable[, "nsplit"]),
+    cp = as.numeric(dt_fit$cptable[, "CP"]),
+    cv_relative_error = as.numeric(dt_fit$cptable[, "xerror"]),
+    cv_classification_error_rate = as.numeric(dt_fit$cptable[, "xerror"]) * root_error_rate,
+    cv_error_std = as.numeric(dt_fit$cptable[, "xstd"]),
+    stringsAsFactors = FALSE,
+    check.names = FALSE
+  )
+
   prob <- as.numeric(
     predict(dt_fit, newdata = fold_inputs$valid_design_dat, type = "prob")[, "PDAC case"]
   )
@@ -84,6 +97,7 @@ run_fold_dt <- function(fold_inputs, cp_dt = 0.001, maxdepth = 20) {
     prob = prob,
     selected_variables = selected_variables,
     selected_miRNA = selected_miRNA,
+    cv_classification_error = cv_classification_error,
     feature_importance = feature_importance,
     tuning = data.frame(
       model = "decision_tree",

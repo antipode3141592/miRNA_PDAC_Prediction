@@ -35,7 +35,7 @@ train_fraction <- 0.8
 k <- 10
 
 fold_filter_top_n <- 25
-lasso_alpha <- 1
+lasso_alpha_grid <- c(0.5, 0.6, 0.75, 0.9, 0.95, 1)
 
 demographic_covariates <- c("Sex", "Race", "Age")
 factor_demographic_covariates <- c("Sex", "Race")
@@ -88,7 +88,7 @@ selected_miRNA <- select_top_limma_miRNA(
 model_runner <- function(fold_inputs) {
   run_fold_lasso(
     fold_inputs,
-    alpha_lasso = lasso_alpha
+    alpha_lasso = lasso_alpha_grid
   )
 }
 
@@ -114,9 +114,12 @@ holdout_results <- run_single_model_holdout(
 ```
 
 ```{r final_objects, include=FALSE}
+lasso_final_alpha <- holdout_results$final_model_output$final_alpha
+
 lasso_results <- list(
   train_filter_results = train_filter_results,
   selected_miRNA = selected_miRNA,
+  alpha_grid = lasso_alpha_grid,
   cv_predictions = cv_results$cv_predictions,
   cv_tuning = cv_results$cv_tuning,
   cv_feature_counts = cv_results$cv_feature_counts,
@@ -127,6 +130,7 @@ lasso_results <- list(
   holdout_roc = holdout_results$holdout_roc,
   holdout_predictions = holdout_results$holdout_predictions,
   holdout_summary = holdout_results$holdout_summary,
+  final_alpha = lasso_final_alpha,
   final_fold_inputs = holdout_results$final_fold_inputs,
   final_model_output = holdout_results$final_model_output
 )
