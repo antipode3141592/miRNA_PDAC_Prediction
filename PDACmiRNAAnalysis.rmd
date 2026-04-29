@@ -86,23 +86,26 @@ model_names <- c("forward_step", "lasso", "enet", "lda", "random_forest", "decis
 
 forward_step_max_steps <- 25
 
-lasso_alpha_grid <- c(0.45, 0.50, 0.55, 0.6, 0.65)
+lasso_alpha_grid <- seq(0.1, 1.0, by = 0.05)
 
-enet_alpha_grid <- c(0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 1.0)
+enet_alpha_grid <- seq(0.1, 1.0, by = 0.05)
 
 lda_prior <- c(0.5, 0.5)
 
-rf_ntree <- 10
-rf_mtry_grid <- c(15L, 20L, 25L)
+rf_ntree <- 1000
+rf_mtry_grid <- c(20L, 30L, 40L)
 
-dt_maxdepth <- 9
+dt_maxdepth <- 30 #30 is limit for rpart
 
 tree_model_names <- c("random_forest", "decision_tree")
 
 log2_pseudocount <- 1
+
+include_limma_filter <- TRUE
 run_limma_analysis <- FALSE
 
 fold_filter_name <- "blocked limma"
+limma_feature_p_value_threshold <- 0.1
 fold_filter_top_n <- 25
 rf_top_m_features <- fold_filter_top_n
 rf_importance_metric <- "MeanDecreaseAccuracy"
@@ -260,13 +263,21 @@ model_runner_map <- list(
   lasso = function(fold_inputs) {
     run_fold_lasso(
       fold_inputs,
-      alpha_lasso = lasso_alpha_grid
+      alpha_lasso = lasso_fixed_tuning$alpha[[1]],
+      lambda_lasso = lasso_fixed_tuning$lambda[[1]],
+      tuning_cv_score = lasso_fixed_tuning$cv_score[[1]],
+      alpha_grid = lasso_fixed_tuning$alpha_grid[[1]],
+      tuning_source = lasso_fixed_tuning$tuning_source[[1]]
     )
   },
   enet = function(fold_inputs) {
     run_fold_enet(
       fold_inputs,
-      alpha_enet = enet_alpha_grid
+      alpha_enet = enet_fixed_tuning$alpha[[1]],
+      lambda_enet = enet_fixed_tuning$lambda[[1]],
+      tuning_cv_score = enet_fixed_tuning$cv_score[[1]],
+      alpha_grid = enet_fixed_tuning$alpha_grid[[1]],
+      tuning_source = enet_fixed_tuning$tuning_source[[1]]
     )
   },
   lda = function(fold_inputs) {
@@ -292,22 +303,40 @@ model_runner_map <- list(
   }
 )
 
-select_top_limma_miRNA <- function(limma_stats, top_n) {
-  limma_stats %>%
-    slice_min(order_by = .data$limma_p_value, n = top_n, with_ties = TRUE) %>%
+select_top_limma_miRNA <- function(limma_stats, top_n = NULL, p_value_threshold = NULL) {
+  ranked_stats <- limma_stats %>%
     arrange(.data$limma_p_value, desc(abs(.data$limma_t)), .data$miRNA)
+
+  if (!is.null(p_value_threshold)) {
+    if (!is.numeric(p_value_threshold) || length(p_value_threshold) != 1L ||
+        !is.finite(p_value_threshold) || p_value_threshold <= 0 || p_value_threshold > 1) {
+      stop("p_value_threshold must be a single numeric value in the interval (0, 1].", call. = TRUE)
+    }
+
+    ranked_stats %>%
+      filter(is.finite(.data$limma_p_value), .data$limma_p_value < p_value_threshold)
+  } else {
+    if (is.null(top_n) || !is.numeric(top_n) || length(top_n) != 1L ||
+        !is.finite(top_n) || top_n < 1L) {
+      stop("top_n must be a single positive integer when p_value_threshold is not provided.", call. = TRUE)
+    }
+
+    ranked_stats %>%
+      slice_min(order_by = .data$limma_p_value, n = top_n, with_ties = TRUE) %>%
+      arrange(.data$limma_p_value, desc(abs(.data$limma_t)), .data$miRNA)
+  }
 }
 
 get_model_preselected_miRNA <- function(
   model_name,
   limma_stats,
   all_miRNA = miRNA_all_columns,
-  base_top_n = fold_filter_top_n
+  p_value_threshold = limma_feature_p_value_threshold
 ) {
-  if (model_name %in% tree_model_names) {
+  if ((model_name %in% tree_model_names) || !include_limma_filter) {
     all_miRNA
   } else {
-    select_top_limma_miRNA(limma_stats, top_n = base_top_n)$miRNA
+    select_top_limma_miRNA(limma_stats, p_value_threshold = p_value_threshold)$miRNA
   }
 }
 
@@ -498,7 +527,7 @@ render_html_table(class_balance, caption = "Training and holdout class balance")
 ```
 
 ## Perform Differential Expression Filtering
-The limma filtering is based on a blocked linear model with duplicate-correlation adjustment for matched sets and is run once on the full training set. `r limma_group_term` is the term of interest and `r limma_adjustment_covariate_text` are adjustment covariates. The top N miRNAs are selected based on the smallest limma p-values, with ties broken by the absolute moderated t-statistic.
+The limma filtering is based on a blocked linear model with duplicate-correlation adjustment for matched sets and is run once on the full training set. `r limma_group_term` is the term of interest and `r limma_adjustment_covariate_text` are adjustment covariates. The default non-tree feature pool keeps every miRNA with a blocked-limma p-value below `r limma_feature_p_value_threshold`, ordered by p-value, absolute moderated t-statistic, and miRNA identifier.
 ```{r limma_filter_results, eval=run_limma_analysis, include=FALSE}
 
 train_filter_results <- differential_expression_filter_fn(
@@ -506,6 +535,7 @@ train_filter_results <- differential_expression_filter_fn(
   miRNA_cols = miRNA_all_columns,
   filter_stat_cols = filter_stat_cols,
   top_n = fold_filter_top_n,
+  p_value_threshold = limma_feature_p_value_threshold,
   group_term = limma_group_term,
   adjustment_covariates = limma_adjustment_covariates
 )
@@ -525,6 +555,19 @@ train_filter_results <- readRDS("Data/Full train_filter_results.rds")
 
 ```
 
+```{r refresh_limma_selected_subset, include=FALSE}
+
+train_filter_results$selected <- select_top_limma_miRNA(
+  train_filter_results$stats,
+  p_value_threshold = limma_feature_p_value_threshold
+)$miRNA
+
+if (!length(train_filter_results$selected)) {
+  stop("Blocked limma selection yielded zero selected miRNAs under the current p-value threshold.", call. = TRUE)
+}
+
+```
+
 ```{r limma_filter_summary, echo=FALSE, results='asis'}
 
 write.csv(
@@ -535,31 +578,33 @@ write.csv(
 
 ```
 
-## Top `r fold_filter_top_n` miRNAs Selected by Differential Expression
+## miRNAs with Blocked-limma P-Value < `r limma_feature_p_value_threshold`
 ```{r top_limma_miRNA_table, echo=FALSE, results='asis'}
 
-# train_filter_results$selected is the default top-N limma vector passed to the non-tree models.
-# Here we show that default top-ranked set by p-value with its limma statistics for context.
+# train_filter_results$selected stores the default limma p-value-threshold subset.
+# When include_limma_filter is TRUE, this vector becomes the active non-tree feature pool.
+# When include_limma_filter is FALSE, the ranking is reported for reference only.
 
 top_ranked_miRNA <- select_top_limma_miRNA(
   train_filter_results$stats,
-  top_n = fold_filter_top_n
+  p_value_threshold = limma_feature_p_value_threshold
 )
 
 render_html_table(
   top_ranked_miRNA,
   caption = paste(
-    "Top",
-    fold_filter_top_n,
+    "miRNAs with",
     fold_filter_name,
-    "selected miRNAs on the full training set"
+    "p-value <",
+    limma_feature_p_value_threshold,
+    "on the full training set"
   ),
   digits = 4
 )
 
 write.csv(
   top_ranked_miRNA,
-  paste0("Tables/Top ", fold_filter_top_n, " ", fold_filter_name, " selected miRNAs with stats on full training set.csv"),
+  "Tables/Blocked limma selected miRNAs with stats on full training set.csv",
   row.names = FALSE
 )
 
@@ -571,7 +616,7 @@ write.csv(
 
 #describe shape of top_ranked_miRNA table and train_filter_results$selected vector for context
 cat(
-  "The top-ranked miRNAs table has",
+  "The blocked-limma selected miRNAs table has",
   nrow(top_ranked_miRNA),
   "rows and",
   ncol(top_ranked_miRNA),
@@ -587,7 +632,15 @@ overlap_table <- data.frame(
 )
 
 ```
-These top `r fold_filter_top_n` miRNAs remain the default candidate feature set for the forward-step, lasso, elastic-net, and LDA models in the subsequent cross-validation step. The random forest and decision tree models are instead given the full log2-transformed miRNA set without limma prefiltering.
+`r if (include_limma_filter) {
+  paste0(
+    "These miRNAs with blocked-limma p-value < ",
+    limma_feature_p_value_threshold,
+    " remain the default candidate feature set for the forward-step, lasso, elastic-net, and LDA models in the subsequent cross-validation step. The random forest and decision tree models are instead given the full log2-transformed miRNA set without limma prefiltering."
+  )
+} else {
+  "The blocked-limma ranking shown above is reported for reference only; all models use the full log2-transformed miRNA set because include_limma_filter is FALSE."
+}`
 
 # Cross-Validation Loop
 ```{r k_definition, include=FALSE}
@@ -598,10 +651,19 @@ k <- 10
 We perform a `r k`-fold cross-validation on the training set of paired samples, ensuring matched-samples are kept together in the same fold.
 
 Within each fold:
-1. We restrict the log2-transformed normalized count matrix to the top `r fold_filter_top_n` limma-selected miRNAs for the forward-step, lasso, elastic-net, and LDA models, while the random forest and decision tree models receive the full log2-transformed miRNA set without limma prefiltering.
+1. `r if (include_limma_filter) {
+  paste0(
+    "We restrict the log2-transformed normalized count matrix to all miRNAs with blocked-limma p-value < ",
+    limma_feature_p_value_threshold,
+    " for the forward-step, lasso, elastic-net, and LDA models, while the random forest and decision tree models receive the full log2-transformed miRNA set without limma prefiltering."
+  )
+} else {
+  "All models receive the full log2-transformed miRNA set without limma prefiltering."
+}`
 2. We then fit each model using its assigned miRNA input pool `r model_design_text`.
 3. The LDA and forward-step models additionally standardize only the selected miRNA log-count columns using training-fold means and standard deviations before fitting, and apply the same transformation to the corresponding validation data.
-4. The random forest model additionally evaluates `r write_comma_separated_list(rf_mtry_grid)` as candidate `mtry` values and keeps the fit with the lowest out-of-bag classification error.
+4. The lasso and elastic-net models use `alpha` and `lambda` values chosen once on the full training split, then keep those values fixed throughout the outer cross-validation loop and the final holdout fit.
+5. The random forest model additionally evaluates `r write_comma_separated_list(rf_mtry_grid)` as candidate `mtry` values and keeps the fit with the lowest out-of-bag classification error.
 ```{r fold_input_helpers, include=FALSE}
 
 map_to_training_levels <- function(values, training_levels) {
@@ -713,6 +775,27 @@ prepare_fold_inputs <- function(train_fold_dat, valid_fold_dat, selected_miRNA) 
 }
 ```
 
+```{r fixed_glmnet_hyperparameters, include=FALSE}
+
+glmnet_tuning_inputs <- prepare_model_fold_inputs(
+  train_set,
+  holdout,
+  train_filter_results$stats,
+  active_model_names = c("lasso", "enet")
+)
+
+lasso_fixed_tuning <- select_lasso_hyperparameters(
+  glmnet_tuning_inputs[["lasso"]],
+  alpha_lasso = lasso_alpha_grid
+)
+
+enet_fixed_tuning <- select_enet_hyperparameters(
+  glmnet_tuning_inputs[["enet"]],
+  alpha_enet = enet_alpha_grid
+)
+
+```
+
 ```{r cross_validation_run, include=FALSE}
 
 cv_set_ids <- unique(train_set$matched_set)
@@ -803,6 +886,60 @@ render_html_table(
 
 ```
 
+### ROC-AUC Plots for CV Folds
+```{r cv_roc_auc_plots, echo=FALSE, results='asis', fig.width=8, fig.height=6}
+cv_roc_curves <- lapply(model_names, function(model_name) {
+  pred_df <- bind_rows(cv_predictions[[model_name]])
+  roc(pred_df$observed, pred_df$prob, quiet = TRUE)
+})
+names(cv_roc_curves) <- model_names
+
+cv_roc_labels <- vapply(model_names, function(model_name) {
+  sprintf(
+    "%s (AUC = %.3f)",
+    model_display_name(model_name),
+    as.numeric(auc(cv_roc_curves[[model_name]]))
+  )
+}, character(1))
+
+cv_roc_label_order <- cv_roc_labels[cv_summary$model[order(-cv_summary$cv_auc)]]
+
+cv_roc_curve_data <- bind_rows(lapply(model_names, function(model_name) {
+  roc_obj <- cv_roc_curves[[model_name]]
+
+  data.frame(
+    false_positive_rate = 1 - roc_obj$specificities,
+    true_positive_rate = roc_obj$sensitivities,
+    legend_label = cv_roc_labels[[model_name]],
+    row.names = NULL
+  )
+}))
+
+cv_roc_curve_data$legend_label <- factor(
+  cv_roc_curve_data$legend_label,
+  levels = cv_roc_label_order
+)
+
+cv_roc_curve_plot <- ggplot(
+  cv_roc_curve_data,
+  aes(x = false_positive_rate, y = true_positive_rate, color = legend_label)
+) +
+  geom_line(linewidth = 1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray40") +
+  coord_equal(xlim = c(0, 1), ylim = c(0, 1)) +
+  labs(
+    title = "Cross-Validation ROC Curve Comparison of All Models",
+    x = "FP Rate",
+    y = "TP Rate",
+    color = "Model"
+  ) +
+  theme_minimal()
+
+print(cv_roc_curve_plot)
+```
+This plot compares the ROC curves for all models across the pooled cross-validation predictions.
+
+
 ### Stable Features in CV Folds
 Summarize feature selection stability across folds for each model
 
@@ -857,7 +994,11 @@ fold_filter_summary <- bind_rows(lapply(model_names, function(model_name) {
 
 render_html_table(
   fold_filter_summary,
-  caption = paste("Number of", fold_filter_name, "preselected miRNAs supplied to each model by fold")
+  caption = if (include_limma_filter) {
+    paste("Number of", fold_filter_name, "preselected miRNAs supplied to each model by fold")
+  } else {
+    "Number of miRNAs supplied to each model by fold"
+  }
 )
 
 ```
@@ -873,16 +1014,26 @@ final_fold_inputs_by_model <- prepare_model_fold_inputs(
   train_filter_results$stats
 )
 
-default_feature_pool_size <- length(select_top_limma_miRNA(
-  final_filter_results$stats,
-  top_n = fold_filter_top_n
-)$miRNA)
+default_feature_pool_size <- if (include_limma_filter) {
+  length(select_top_limma_miRNA(
+    final_filter_results$stats,
+    p_value_threshold = limma_feature_p_value_threshold
+  )$miRNA)
+} else {
+  length(miRNA_all_columns)
+}
 tree_feature_pool_size <- length(miRNA_all_columns)
 
 cat(
-  "<p>Number of final ",
-  fold_filter_name,
-  " selected miRNAs supplied to the forward-step/lasso/elastic-net/LDA pool: ",
+  if (include_limma_filter) {
+    paste0(
+      "<p>Number of final ",
+      fold_filter_name,
+      " selected miRNAs supplied to the forward-step/lasso/elastic-net/LDA pool: "
+    )
+  } else {
+    "<p>Number of miRNAs supplied to the forward-step/lasso/elastic-net/LDA pool without limma filtering: "
+  },
   default_feature_pool_size,
   "; supplied to the random-forest/decision-tree pool (full miRNA set): ",
   tree_feature_pool_size,
@@ -1179,7 +1330,12 @@ if (is.null(rf_optimal_ntree) || !length(rf_optimal_ntree) || !is.finite(rf_opti
 rf_optimal_oob_error <- rf_final_oob_error_curve$oob_error[[
   match(rf_optimal_ntree, rf_final_oob_error_curve$n_trees)
 ]]
+rf_optimal_oob_error_smoothed <- rf_final_oob_error_curve$oob_error_smoothed[[
+  match(rf_optimal_ntree, rf_final_oob_error_curve$n_trees)
+]]
 rf_best_mtry <- final_model_outputs[["random_forest"]]$tuning$mtry[[1]]
+rf_ntree_selection_burn_in <- final_model_outputs[["random_forest"]]$tuning$ntree_selection_burn_in[[1]]
+rf_ntree_smoothing_window <- final_model_outputs[["random_forest"]]$tuning$ntree_selection_smoothing_window[[1]]
 
 write.csv(
   rf_final_oob_error_curve,
@@ -1189,27 +1345,39 @@ write.csv(
 
 cat(
   sprintf(
-    "<p>For the best random-forest fit at mtry = %d, the first minimum OOB classification error was %.3f at %d trees, and the final random-forest model was refit using that tree count.</p>\n",
+    "<p>For the best random-forest fit at mtry = %d, the final tree count was set to %d using the minimum %d-tree moving-average OOB classification error after a %d-tree burn-in. The selected forest had raw OOB classification error %.3f and smoothed OOB classification error %.3f.</p>\n",
     rf_best_mtry,
+    rf_optimal_ntree,
+    rf_ntree_smoothing_window,
+    rf_ntree_selection_burn_in,
     rf_optimal_oob_error,
-    rf_optimal_ntree
+    rf_optimal_oob_error_smoothed
   )
 )
 
 rf_oob_error_curve_plot <- ggplot(
   rf_final_oob_error_curve,
-  aes(x = .data$n_trees, y = .data$oob_error)
+  aes(x = .data$n_trees)
 ) +
-  geom_line(color = "#2C7FB8", linewidth = 0.9) +
+  geom_line(aes(y = .data$oob_error), color = "#A6CEE3", linewidth = 0.8, alpha = 0.9) +
+  geom_line(aes(y = .data$oob_error_smoothed), color = "#2C7FB8", linewidth = 1) +
+  geom_vline(xintercept = rf_ntree_selection_burn_in, linetype = "dotted", color = "gray50") +
   geom_vline(xintercept = rf_optimal_ntree, linetype = "dashed", color = "#C65D3B") +
   geom_point(
     data = rf_final_oob_error_curve %>% filter(.data$n_trees == rf_optimal_ntree),
+    aes(y = .data$oob_error_smoothed),
     color = "#C65D3B",
     size = 2.5
   ) +
   labs(
     title = "Random Forest OOB Classification Error by Tree Count",
-    subtitle = sprintf("Best mtry = %d; first minimum at %d trees", rf_best_mtry, rf_optimal_ntree),
+    subtitle = sprintf(
+      "Best mtry = %d; selected at %d trees after %d-tree burn-in; dark line = %d-tree moving average",
+      rf_best_mtry,
+      rf_optimal_ntree,
+      rf_ntree_selection_burn_in,
+      rf_ntree_smoothing_window
+    ),
     x = "Number of Trees",
     y = "Out-of-Bag Classification Error"
   ) +
