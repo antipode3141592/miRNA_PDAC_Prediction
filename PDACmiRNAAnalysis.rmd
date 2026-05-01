@@ -29,12 +29,14 @@ library(dplyr)
 library(rpart)
 library(randomForest)
 library(limma)
-library(multiMiR)
 library(mice)
 
 source("R/plotHelpers.R")
+source("R/reportHelpers.R")
+source("R/limma_helpers.R")
 source("R/run_fold_lasso.R")
 source("R/run_fold_enet.R")
+source("R/scale_fold_predictors.R")
 source("R/run_fold_forward_step.R")
 source("R/run_fold_lda.R")
 source("R/run_fold_rf.R")
@@ -51,22 +53,8 @@ report_start_time <- Sys.time()
 ```
 
 ```{r report_table_styles, echo=FALSE, results='asis'}
-
-cat(
-  paste(
-    "<style>",
-    "table {",
-    "  border-collapse: collapse;",
-    "}",
-    "table th,",
-    "table td {",
-    "  border: 1px solid #cfcfcf;",
-    "  padding: 4px 8px;",
-    "}",
-    "</style>",
-    sep = "\n"
-  )
-)
+## Add basic table CSS to HTML render
+render_basic_table_styles()
 
 ```
 
@@ -83,18 +71,43 @@ gene_family_file <- "Data/GSE314577_family.xml/GPL30934-tbl-1.txt"
 
 #model parameters and settings
 model_names <- c("forward_step", "lasso", "enet", "lda", "random_forest", "decision_tree")
-enet_alpha_grid <- c(0.5, 0.6, 0.75, 0.9, 0.95)
+
 forward_step_max_steps <- 25
-lasso_alpha <- 1
+
+lasso_alpha_grid <- seq(0.1, 1.0, by = 0.05)
+
+enet_alpha_grid <- seq(0.1, 1.0, by = 0.05)
+
 lda_prior <- c(0.5, 0.5)
-rf_ntree <- 300
-dt_maxdepth <- 7
+
+rf_ntree <- 1000
+rf_mtry_grid <- c(20L, 30L, 40L)
+
+dt_maxdepth <- 30 #30 is limit for rpart
+
+tree_model_names <- c("random_forest", "decision_tree")
+
+log2_pseudocount <- 1
+
+include_limma_filter <- TRUE
+run_limma_analysis <- FALSE
 
 fold_filter_name <- "blocked limma"
-fold_filter_top_n <- 50
-design_covariates <- c("Sex", "Race", "Age")
+limma_feature_p_value_threshold <- 0.1
+fold_filter_top_n <- 25
+rf_top_m_features <- fold_filter_top_n
+rf_importance_metric <- "MeanDecreaseAccuracy"
+rf_importance_plot_top_n <- max(20L, rf_top_m_features)
+dt_importance_plot_top_n <- max(20L, fold_filter_top_n)
+final_variable_heatmap_max_n <- fold_filter_top_n
+downstream_analysis_inputs_rds_file <- "Data/Top-ranked consensus miRNA downstream inputs.rds"
+
+demographic_covariates <- c("Sex", "Race", "Age")
+factor_demographic_covariates <- c("Sex", "Race")
+use_model_covariates <- TRUE
+
 limma_group_term <- "CC"
-limma_adjustment_covariates <- c("Sex", "Race", "Age")
+limma_adjustment_covariates <- demographic_covariates
 filter_stat_cols <- c(
   "miRNA",
   "mean_control",
@@ -107,18 +120,37 @@ filter_stat_cols <- c(
   "limma_adj_p_value",
   "limma_b"
 )
+
 ```
 
 ```{r dev_block, include=FALSE}
 
 ##### DEVELOPMENT #####
 developmentMode <- FALSE
-development_excluded_models <- c("random_forest", "decision_tree")
+development_use_model_covariates <- FALSE
 
 # models to exclude
 if (developmentMode) {
+  # development_excluded_models <- c("random_forest", "decision_tree")
+  development_excluded_models <- c()
+
+  use_model_covariates <- development_use_model_covariates
   model_names <- setdiff(model_names, development_excluded_models)
 }
+
+model_covariates <- if (use_model_covariates) demographic_covariates else character(0)
+model_covariate_text <- if (length(model_covariates)) {
+  write_comma_separated_list(model_covariates)
+} else {
+  "no demographic covariates"
+}
+model_design_text <- if (length(model_covariates)) {
+  paste("together with", model_covariate_text, "in the design")
+} else {
+  "without additional demographic covariates in the predictive design"
+}
+limma_adjustment_covariate_text <- write_comma_separated_list(limma_adjustment_covariates)
+consensus_model_names <- setdiff(model_names, tree_model_names)
 
 ```
 
@@ -134,13 +166,21 @@ model_runner_map <- list(
   lasso = function(fold_inputs) {
     run_fold_lasso(
       fold_inputs,
-      alpha_lasso = lasso_alpha
+      alpha_lasso = lasso_fixed_tuning$alpha[[1]],
+      lambda_lasso = lasso_fixed_tuning$lambda[[1]],
+      tuning_cv_score = lasso_fixed_tuning$cv_score[[1]],
+      alpha_grid = lasso_fixed_tuning$alpha_grid[[1]],
+      tuning_source = lasso_fixed_tuning$tuning_source[[1]]
     )
   },
   enet = function(fold_inputs) {
     run_fold_enet(
       fold_inputs,
-      alpha_enet = enet_alpha_grid
+      alpha_enet = enet_fixed_tuning$alpha[[1]],
+      lambda_enet = enet_fixed_tuning$lambda[[1]],
+      tuning_cv_score = enet_fixed_tuning$cv_score[[1]],
+      alpha_grid = enet_fixed_tuning$alpha_grid[[1]],
+      tuning_source = enet_fixed_tuning$tuning_source[[1]]
     )
   },
   lda = function(fold_inputs) {
@@ -152,7 +192,10 @@ model_runner_map <- list(
   random_forest = function(fold_inputs) {
     run_fold_rf(
       fold_inputs,
-      ntree = rf_ntree
+      ntree = rf_ntree,
+      mtry_grid = rf_mtry_grid,
+      top_m_features = rf_top_m_features,
+      importance_metric = rf_importance_metric
     )
   },
   decision_tree = function(fold_inputs) {
@@ -163,21 +206,94 @@ model_runner_map <- list(
   }
 )
 
-run_active_models <- function(fold_inputs, active_model_names = model_names) {
+select_top_limma_miRNA <- function(limma_stats, top_n = NULL, p_value_threshold = NULL) {
+  ranked_stats <- limma_stats %>%
+    arrange(.data$limma_p_value, desc(abs(.data$limma_t)), .data$miRNA)
+
+  if (!is.null(p_value_threshold)) {
+    if (!is.numeric(p_value_threshold) || length(p_value_threshold) != 1L ||
+        !is.finite(p_value_threshold) || p_value_threshold <= 0 || p_value_threshold > 1) {
+      stop("p_value_threshold must be a single numeric value in the interval (0, 1].", call. = TRUE)
+    }
+
+    ranked_stats %>%
+      filter(is.finite(.data$limma_p_value), .data$limma_p_value < p_value_threshold)
+  } else {
+    if (is.null(top_n) || !is.numeric(top_n) || length(top_n) != 1L ||
+        !is.finite(top_n) || top_n < 1L) {
+      stop("top_n must be a single positive integer when p_value_threshold is not provided.", call. = TRUE)
+    }
+
+    ranked_stats %>%
+      slice_min(order_by = .data$limma_p_value, n = top_n, with_ties = TRUE) %>%
+      arrange(.data$limma_p_value, desc(abs(.data$limma_t)), .data$miRNA)
+  }
+}
+
+get_model_preselected_miRNA <- function(
+  model_name,
+  limma_stats,
+  all_miRNA = miRNA_all_columns,
+  p_value_threshold = limma_feature_p_value_threshold
+) {
+  if ((model_name %in% tree_model_names) || !include_limma_filter) {
+    all_miRNA
+  } else {
+    select_top_limma_miRNA(limma_stats, p_value_threshold = p_value_threshold)$miRNA
+  }
+}
+
+prepare_model_fold_inputs <- function(
+  train_fold_dat,
+  valid_fold_dat,
+  limma_stats,
+  active_model_names = model_names,
+  all_miRNA = miRNA_all_columns
+) {
+  model_fold_inputs <- lapply(active_model_names, function(model_name) {
+    selected_miRNA <- get_model_preselected_miRNA(
+      model_name = model_name,
+      limma_stats = limma_stats,
+      all_miRNA = all_miRNA
+    )
+
+    prepare_fold_inputs(
+      train_fold_dat = train_fold_dat,
+      valid_fold_dat = valid_fold_dat,
+      selected_miRNA = selected_miRNA
+    )
+  })
+  names(model_fold_inputs) <- active_model_names
+
+  model_fold_inputs
+}
+
+run_active_models <- function(model_fold_inputs, active_model_names = model_names) {
   unknown_model_names <- setdiff(active_model_names, names(model_runner_map))
+  missing_fold_inputs <- setdiff(active_model_names, names(model_fold_inputs))
 
   if (length(unknown_model_names)) {
     stop(
       sprintf(
         "Requested models are not registered: %s",
-        paste(unknown_model_names, collapse = ", ")
+        write_comma_separated_list(unknown_model_names)
+      ),
+      call. = TRUE
+    )
+  }
+
+  if (length(missing_fold_inputs)) {
+    stop(
+      sprintf(
+        "Fold inputs were not prepared for: %s",
+        write_comma_separated_list(missing_fold_inputs)
       ),
       call. = TRUE
     )
   }
 
   model_outputs <- lapply(active_model_names, function(model_name) {
-    model_runner_map[[model_name]](fold_inputs)
+    model_runner_map[[model_name]](model_fold_inputs[[model_name]])
   })
   names(model_outputs) <- active_model_names
 
@@ -189,15 +305,29 @@ run_active_models <- function(fold_inputs, active_model_names = model_names) {
 # Preparing Data
 
 ## Import Data
-We use the normalized miRNA count matrix from GEO and merge it with the demographic metadata.  Categorical variables are set to factors and the PDAC case and control variable is set to binary for modeling.
+We use the normalized miRNA count matrix from GEO, apply a single log2 transform with a pseudocount of `r log2_pseudocount`, and then merge it with the demographic metadata. Categorical variables are set to factors and the PDAC case and control variable is set to binary for modeling. This ensures that the data is in a suitable format for downstream analysis, including differential expression analysis and predictive modeling.
+
+Like the authors of the original study, we remove three specific miRNA that could be contaminated by the blood withdrawal process:
+- MIMAT00001631 hsa-miR-451a
+- MIMAT0000069 hsa-miR-16-5p
+- MIMAT0015072 hsa-miR-320e
+
 
 ```{r data_import, include=FALSE}
 
 normalized_counts <- read_xlsx(normalized_data_file)
+# remove three miRNA that could be contaminated by blood withdrawl process
+normalized_counts <- normalized_counts %>%
+  dplyr::select(-tidyselect::any_of(c("MIMAT00001631", "MIMAT0000069", "MIMAT0015072")))
+
 metadata <- read_xlsx(metadata_file)
 
+raw_miRNA_values <- as.numeric(as.matrix(normalized_counts[, grep("^MIMAT", names(normalized_counts))]))
 normalized_counts <- normalized_counts %>%
-  mutate(ID = as.character(.data$ID))
+  mutate(ID = as.character(.data$ID)) %>%
+  mutate(across(starts_with("MIMAT"), ~ log2(.x + log2_pseudocount)))
+
+transformed_miRNA_values <- as.numeric(as.matrix(normalized_counts[, grep("^MIMAT", names(normalized_counts))]))
 
 metadata <- metadata %>%
   mutate(
@@ -215,10 +345,44 @@ full_dat <- metadata %>%
 
 miRNA_all_columns <- grep("^MIMAT", names(full_dat), value = TRUE)
 
+#remove 3 specific miRNA columns that are possibly contamination
+miRNA_all_columns <- setdiff(miRNA_all_columns, c("MIMAT0000001", "MIMAT0000002", "MIMAT0000003"))
+
+
 cat("Rows/columns in merged dataset:", dim(full_dat), "\n")
 cat("Number of miRNA columns:", length(miRNA_all_columns), "\n")
 
 ```
+
+```{r log2_transform_qq_comparison, echo=FALSE, fig.width=10, fig.height=5}
+
+plot_settings <- par(mfrow = c(1, 2), mar = c(4, 4, 3, 1))
+on.exit(par(plot_settings), add = TRUE)
+
+qqnorm(
+  raw_miRNA_values,
+  main = "Before Log2 Transform",
+  xlab = "Theoretical Quantiles",
+  ylab = "Sample Quantiles",
+  pch = 16,
+  cex = 0.3,
+  col = rgb(59 / 255, 91 / 255, 146 / 255, 0.25)
+)
+qqline(raw_miRNA_values, col = "#C65D3B", lwd = 2)
+
+qqnorm(
+  transformed_miRNA_values,
+  main = paste0("After Log2(x + ", log2_pseudocount, ")"),
+  xlab = "Theoretical Quantiles",
+  ylab = "Sample Quantiles",
+  pch = 16,
+  cex = 0.3,
+  col = rgb(59 / 255, 91 / 255, 146 / 255, 0.25)
+)
+qqline(transformed_miRNA_values, col = "#C65D3B", lwd = 2)
+
+```
+The side-by-side QQ plots below show how the global miRNA value distribution shifts after the import-time log2 transform. The non-linearity of the miRNA counts is evident both before and after log2 transformation. Linearity is non a requirement for the downstream models, but the log2 transformation helps stabilize variance.
 
 ```{r missing_value_check, include=FALSE}
 
@@ -230,7 +394,6 @@ The dataset is fully observed with no missing values, so we can proceed without 
 
 ## Create Training and Holdout Sets
 To split the data while respecting matched-pairs, we performed the split on the matched set IDs, ensuring each pair is not split between sets.
-
 ```{r training_split, echo=FALSE, results='asis'}
 
 all_sets <- unique(full_dat$matched_set)
@@ -267,28 +430,44 @@ render_html_table(class_balance, caption = "Training and holdout class balance")
 ```
 
 ## Perform Differential Expression Filtering
-The limma filtering is based on a blocked linear model with duplicate-correlation adjustment for matched sets and is run once on the full training set. In that model, `r limma_group_term` is the term of interest and Sex, Race, and Age are adjustment covariates. The top N miRNAs are selected based on the smallest limma p-values, with ties broken by the absolute moderated t-statistic.
-```{r limma_filter_results, eval=FALSE, include=FALSE}
+The limma filtering is based on a blocked linear model with duplicate-correlation adjustment for matched sets and is run once on the full training set. `r limma_group_term` is the term of interest and `r limma_adjustment_covariate_text` are adjustment covariates. The default non-tree feature pool keeps every miRNA with a blocked-limma p-value below `r limma_feature_p_value_threshold`, ordered by p-value, absolute moderated t-statistic, and miRNA identifier.
+```{r limma_filter_results, eval=run_limma_analysis, include=FALSE}
+
 train_filter_results <- differential_expression_filter_fn(
   train_fold_dat = train_set,
   miRNA_cols = miRNA_all_columns,
   filter_stat_cols = filter_stat_cols,
   top_n = fold_filter_top_n,
+  p_value_threshold = limma_feature_p_value_threshold,
   group_term = limma_group_term,
   adjustment_covariates = limma_adjustment_covariates
 )
+
 ```
 
-```{r store_limma_results, eval=FALSE, include=FALSE}
+```{r store_limma_results, eval=run_limma_analysis, include=FALSE}
 
 # store the full train_filter_results object to disk
 saveRDS(train_filter_results, "Data/Full train_filter_results.rds")
 
 ```
 
-```{r load_filter_results_from_disk, eval=TRUE, include=FALSE}
+```{r load_filter_results_from_disk, eval=!run_limma_analysis, include=FALSE}
 
 train_filter_results <- readRDS("Data/Full train_filter_results.rds")
+
+```
+
+```{r refresh_limma_selected_subset, include=FALSE}
+
+train_filter_results$selected <- select_top_limma_miRNA(
+  train_filter_results$stats,
+  p_value_threshold = limma_feature_p_value_threshold
+)$miRNA
+
+if (!length(train_filter_results$selected)) {
+  stop("Blocked limma selection yielded zero selected miRNAs under the current p-value threshold.", call. = TRUE)
+}
 
 ```
 
@@ -302,30 +481,33 @@ write.csv(
 
 ```
 
-## Top `r fold_filter_top_n` miRNAs selected by the blocked limma filter on the full training set
+## miRNAs with Blocked-limma P-Value < `r limma_feature_p_value_threshold`
 ```{r top_limma_miRNA_table, echo=FALSE, results='asis'}
 
-# train_filter_results$selected is the vector of miRNAs passed downstream for modeling.
-# Here we show the top-ranked miRNAs by p-value with their limma statistics for context.
+# train_filter_results$selected stores the default limma p-value-threshold subset.
+# When include_limma_filter is TRUE, this vector becomes the active non-tree feature pool.
+# When include_limma_filter is FALSE, the ranking is reported for reference only.
 
-top_ranked_miRNA <- train_filter_results$stats %>%
-  slice_min(order_by = limma_p_value, n = fold_filter_top_n, with_ties = TRUE) %>%
-  arrange(limma_p_value, desc(abs(limma_t)), miRNA)
+top_ranked_miRNA <- select_top_limma_miRNA(
+  train_filter_results$stats,
+  p_value_threshold = limma_feature_p_value_threshold
+)
 
 render_html_table(
   top_ranked_miRNA,
   caption = paste(
-    "Top",
-    fold_filter_top_n,
+    "miRNAs with",
     fold_filter_name,
-    "selected miRNAs on the full training set"
+    "p-value <",
+    limma_feature_p_value_threshold,
+    "on the full training set"
   ),
   digits = 4
 )
 
 write.csv(
   top_ranked_miRNA,
-  paste0("Tables/Top ", fold_filter_top_n, " ", fold_filter_name, " selected miRNAs with stats on full training set.csv"),
+  "Tables/Blocked limma selected miRNAs with stats on full training set.csv",
   row.names = FALSE
 )
 
@@ -337,7 +519,7 @@ write.csv(
 
 #describe shape of top_ranked_miRNA table and train_filter_results$selected vector for context
 cat(
-  "The top-ranked miRNAs table has",
+  "The blocked-limma selected miRNAs table has",
   nrow(top_ranked_miRNA),
   "rows and",
   ncol(top_ranked_miRNA),
@@ -353,20 +535,40 @@ overlap_table <- data.frame(
 )
 
 ```
-These top `r fold_filter_top_n` miRNAs are then used as the shared candidate feature set for all models in the subsequent cross-validation step, with the rationale that this filtering step is necessary to reduce the feature space to a level that can be effectively handled by the models given the sample size, while still being broad enough to allow for model-specific feature selection and not biasing towards any one model's selection criteria.
+`r if (include_limma_filter) {
+  paste0(
+    "These miRNAs with blocked-limma p-value < ",
+    limma_feature_p_value_threshold,
+    " remain the default candidate feature set for the forward-step, lasso, elastic-net, and LDA models in the subsequent cross-validation step. The random forest and decision tree models are instead given the full log2-transformed miRNA set without limma prefiltering."
+  )
+} else {
+  "The blocked-limma ranking shown above is reported for reference only; all models use the full log2-transformed miRNA set because include_limma_filter is FALSE."
+}`
 
 # Cross-Validation Loop
 ```{r k_definition, include=FALSE}
 
-k <- 5
+k <- 10
 
 ```
 We perform a `r k`-fold cross-validation on the training set of paired samples, ensuring matched-samples are kept together in the same fold.
 
 Within each fold:
-1. We restrict the normalized count matrix to the top `r fold_filter_top_n` miRNAs selected from the limma analysis on the full training set.
-2. We then fit each model using that shared subset of miRNAs together with Sex, Race, and Age in the design. The `matched_set` identifier is used for grouped splitting and blocked limma, but not as a predictive covariate because holdout matched sets are unseen by construction.
+1. `r if (include_limma_filter) {
+  paste0(
+    "We restrict the log2-transformed normalized count matrix to all miRNAs with blocked-limma p-value < ",
+    limma_feature_p_value_threshold,
+    " for the forward-step, lasso, elastic-net, and LDA models, while the random forest and decision tree models receive the full log2-transformed miRNA set without limma prefiltering."
+  )
+} else {
+  "All models receive the full log2-transformed miRNA set without limma prefiltering."
+}`
+2. We then fit each model using its assigned miRNA input pool `r model_design_text`.
+3. The LDA and forward-step models additionally standardize only the selected miRNA log-count columns using training-fold means and standard deviations before fitting, and apply the same transformation to the corresponding validation data.
+4. The lasso and elastic-net models use `alpha` and `lambda` values chosen once on the full training split, then keep those values fixed throughout the outer cross-validation loop and the final holdout fit.
+5. The random forest model additionally evaluates `r write_comma_separated_list(rf_mtry_grid)` as candidate `mtry` values and keeps the fit with the lowest out-of-bag classification error.
 ```{r fold_input_helpers, include=FALSE}
+
 map_to_training_levels <- function(values, training_levels) {
   if (!length(training_levels)) {
     stop("No training levels were available for factor alignment.", call. = TRUE)
@@ -387,6 +589,22 @@ build_penalty_factor <- function(column_names, protected_terms) {
   penalty_factor
 }
 
+is_model_covariate_term <- function(variable_names, covariate_names = model_covariates) {
+  if (!length(variable_names)) {
+    return(logical(0))
+  }
+
+  if (!length(covariate_names)) {
+    return(rep(FALSE, length(variable_names)))
+  }
+
+  vapply(
+    variable_names,
+    function(variable_name) any(startsWith(variable_name, covariate_names)),
+    logical(1)
+  )
+}
+
 prepare_fold_inputs <- function(train_fold_dat, valid_fold_dat, selected_miRNA) {
   train_fold_dat <- train_fold_dat %>%
     mutate(CC_bin = if_else(.data$CC == "PDAC case", 1, 0))
@@ -397,27 +615,23 @@ prepare_fold_inputs <- function(train_fold_dat, valid_fold_dat, selected_miRNA) 
     stop("Feature filtering returned zero miRNAs.", call. = TRUE)
   }
 
-  keep_cols <- c("CC", "CC_bin", design_covariates, selected_miRNA)
+  keep_cols <- c("CC", "CC_bin", model_covariates, selected_miRNA)
   train_model_dat <- train_fold_dat %>%
     dplyr::select(tidyselect::all_of(keep_cols)) %>%
-    droplevels() %>%
-    mutate(Age = as.numeric(.data$Age))
+    droplevels()
   valid_model_dat <- valid_fold_dat %>%
-    dplyr::select(tidyselect::all_of(keep_cols)) %>%
-    mutate(Age = as.numeric(.data$Age))
+    dplyr::select(tidyselect::all_of(keep_cols))
 
-  training_levels <- list(
-    Sex = levels(train_model_dat$Sex),
-    Race = levels(train_model_dat$Race)
-  )
+  factor_covariates <- intersect(factor_demographic_covariates, model_covariates)
 
-  valid_model_dat <- valid_model_dat %>%
-    mutate(
-      Sex = map_to_training_levels(.data$Sex, training_levels$Sex),
-      Race = map_to_training_levels(.data$Race, training_levels$Race)
+  for (covariate_name in factor_covariates) {
+    valid_model_dat[[covariate_name]] <- map_to_training_levels(
+      valid_model_dat[[covariate_name]],
+      levels(train_model_dat[[covariate_name]])
     )
+  }
 
-  raw_model_formula <- stats::reformulate(c(design_covariates, selected_miRNA), response = "CC_bin")
+  raw_model_formula <- stats::reformulate(c(model_covariates, selected_miRNA), response = "CC_bin")
   train_design_matrix <- stats::model.matrix(raw_model_formula, data = train_model_dat)
   valid_design_matrix <- stats::model.matrix(raw_model_formula, data = valid_model_dat)
   x_train <- train_design_matrix[, -1, drop = FALSE]
@@ -425,7 +639,11 @@ prepare_fold_inputs <- function(train_fold_dat, valid_fold_dat, selected_miRNA) 
   design_feature_cols <- colnames(x_train)
   base_feature_cols <- design_feature_cols[!(design_feature_cols %in% selected_miRNA)]
   model_formula <- stats::reformulate(design_feature_cols, response = "CC_bin")
-  base_model_formula <- stats::reformulate(base_feature_cols, response = "CC_bin")
+  base_model_formula <- if (length(base_feature_cols)) {
+    stats::reformulate(base_feature_cols, response = "CC_bin")
+  } else {
+    stats::as.formula("CC_bin ~ 1")
+  }
   class_formula <- stats::reformulate(design_feature_cols, response = "CC")
   train_design_dat <- data.frame(
     CC = train_model_dat$CC,
@@ -442,14 +660,15 @@ prepare_fold_inputs <- function(train_fold_dat, valid_fold_dat, selected_miRNA) 
 
   list(
     selected_miRNA = selected_miRNA,
-    design_covariates = design_covariates,
+    model_covariates = model_covariates,
+    design_feature_cols = design_feature_cols,
     base_feature_cols = base_feature_cols,
     base_model_formula = base_model_formula,
     model_formula = model_formula,
     class_formula = class_formula,
     x_train = x_train,
     x_valid = x_valid,
-    penalty_factor = build_penalty_factor(design_feature_cols, design_covariates),
+    penalty_factor = build_penalty_factor(design_feature_cols, model_covariates),
     y_train = train_model_dat$CC_bin,
     train_model_dat = train_model_dat,
     valid_model_dat = valid_model_dat,
@@ -457,6 +676,27 @@ prepare_fold_inputs <- function(train_fold_dat, valid_fold_dat, selected_miRNA) 
     valid_design_dat = valid_design_dat
   )
 }
+```
+
+```{r fixed_glmnet_hyperparameters, include=FALSE}
+
+glmnet_tuning_inputs <- prepare_model_fold_inputs(
+  train_set,
+  holdout,
+  train_filter_results$stats,
+  active_model_names = c("lasso", "enet")
+)
+
+lasso_fixed_tuning <- select_lasso_hyperparameters(
+  glmnet_tuning_inputs[["lasso"]],
+  alpha_lasso = lasso_alpha_grid
+)
+
+enet_fixed_tuning <- select_enet_hyperparameters(
+  glmnet_tuning_inputs[["enet"]],
+  alpha_enet = enet_alpha_grid
+)
+
 ```
 
 ```{r cross_validation_run, include=FALSE}
@@ -473,13 +713,14 @@ cv_predictions <- list()
 feature_tracker <- list()
 tuning_tracker <- list()
 feature_count_tracker <- list()
-filter_sizes <- integer(k)
+preselected_feature_count_tracker <- list()
 
 for (model_name in model_names) {
   cv_predictions[[model_name]] <- list()
   feature_tracker[[model_name]] <- list()
   tuning_tracker[[model_name]] <- list()
   feature_count_tracker[[model_name]] <- integer(k)
+  preselected_feature_count_tracker[[model_name]] <- integer(k)
 }
 
 for (fold in 1:k) {
@@ -490,17 +731,16 @@ for (fold in 1:k) {
   cv_train <- train_set %>% filter(!matched_set %in% test_sets)
   cv_test <- train_set %>% filter(matched_set %in% test_sets)
 
-  fold_inputs <- prepare_fold_inputs(
+  model_fold_inputs <- prepare_model_fold_inputs(
     cv_train,
     cv_test,
-    train_filter_results$selected
+    train_filter_results$stats
   )
 
-  filter_sizes[fold] <- length(fold_inputs$selected_miRNA)
-
-  model_outputs <- run_active_models(fold_inputs)
+  model_outputs <- run_active_models(model_fold_inputs)
 
   for (model_name in model_names) {
+    model_inputs <- model_fold_inputs[[model_name]]
     model_out <- model_outputs[[model_name]]
 
     cv_predictions[[model_name]][[fold]] <- data.frame(
@@ -512,9 +752,10 @@ for (fold in 1:k) {
       fold = fold
     )
 
-    feature_tracker[[model_name]][[fold]] <- model_out$selected_features
+    feature_tracker[[model_name]][[fold]] <- model_out$selected_miRNA
     tuning_tracker[[model_name]][[fold]] <- model_out$tuning
-    feature_count_tracker[[model_name]][fold] <- length(model_out$selected_features)
+    feature_count_tracker[[model_name]][fold] <- length(model_out$selected_miRNA)
+    preselected_feature_count_tracker[[model_name]][fold] <- length(model_inputs$selected_miRNA)
   }
 }
 
@@ -548,6 +789,59 @@ render_html_table(
 
 ```
 
+### ROC-AUC Plots for CV Folds
+```{r cv_roc_auc_plots, echo=FALSE, results='asis', fig.width=8, fig.height=6}
+cv_roc_curves <- lapply(model_names, function(model_name) {
+  pred_df <- bind_rows(cv_predictions[[model_name]])
+  roc(pred_df$observed, pred_df$prob, quiet = TRUE)
+})
+names(cv_roc_curves) <- model_names
+
+cv_roc_labels <- vapply(model_names, function(model_name) {
+  sprintf(
+    "%s (AUC = %.3f)",
+    model_display_name(model_name),
+    as.numeric(auc(cv_roc_curves[[model_name]]))
+  )
+}, character(1))
+
+cv_roc_label_order <- cv_roc_labels[cv_summary$model[order(-cv_summary$cv_auc)]]
+
+cv_roc_curve_data <- bind_rows(lapply(model_names, function(model_name) {
+  roc_obj <- cv_roc_curves[[model_name]]
+
+  data.frame(
+    false_positive_rate = 1 - roc_obj$specificities,
+    true_positive_rate = roc_obj$sensitivities,
+    legend_label = cv_roc_labels[[model_name]],
+    row.names = NULL
+  )
+}))
+
+cv_roc_curve_data$legend_label <- factor(
+  cv_roc_curve_data$legend_label,
+  levels = cv_roc_label_order
+)
+
+cv_roc_curve_plot <- ggplot(
+  cv_roc_curve_data,
+  aes(x = false_positive_rate, y = true_positive_rate, color = legend_label)
+) +
+  geom_line(linewidth = 1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray40") +
+  coord_equal(xlim = c(0, 1), ylim = c(0, 1)) +
+  labs(
+    title = "Cross-Validation ROC Curve Comparison of All Models",
+    x = "FP Rate",
+    y = "TP Rate",
+    color = "Model"
+  ) +
+  theme_minimal()
+
+print(cv_roc_curve_plot)
+```
+This plot compares the ROC curves for all models across the pooled cross-validation predictions.
+
 
 ### Stable Features in CV Folds
 Summarize feature selection stability across folds for each model
@@ -576,12 +870,12 @@ for (model_name in model_names) {
 
   fold_feature_counts <- data.frame(
     fold = seq_along(feature_count_tracker[[model_name]]),
-    n_selected_features = feature_count_tracker[[model_name]],
+    n_selected_miRNA = feature_count_tracker[[model_name]],
     row.names = NULL
   )
   render_html_table(
     fold_feature_counts,
-    caption = paste("Selected feature counts by fold for", display_name)
+    caption = paste("Selected miRNA counts by fold for", display_name)
   )
 
   tuning_summary <- bind_rows(tuning_tracker[[model_name]])
@@ -592,40 +886,66 @@ for (model_name in model_names) {
   )
 }
 
-fold_filter_summary <- data.frame(
-  fold = seq_along(filter_sizes),
-  n_selected_miRNA = filter_sizes,
-  row.names = NULL
-)
+fold_filter_summary <- bind_rows(lapply(model_names, function(model_name) {
+  data.frame(
+    model = model_display_name(model_name),
+    fold = seq_along(preselected_feature_count_tracker[[model_name]]),
+    n_preselected_miRNA = preselected_feature_count_tracker[[model_name]],
+    row.names = NULL
+  )
+}))
 
 render_html_table(
   fold_filter_summary,
-  caption = paste("Number of", fold_filter_name, "preselected miRNAs available by fold")
+  caption = if (include_limma_filter) {
+    paste("Number of", fold_filter_name, "preselected miRNAs supplied to each model by fold")
+  } else {
+    "Number of miRNAs supplied to each model by fold"
+  }
 )
 
 ```
 
 ## Holdout Evaluation
-Evaluate the final fold, using the calibrated models from the CV step, on the holdout set. We report AUC and accuracy for each model on the holdout set, as well as the number of features selected in each final model and the number of miRNAs that passed the initial limma filter.
+Evaluate the final fold, using the calibrated models from the CV step, on the holdout set. We report AUC and accuracy for each model on the holdout set, as well as the number of features selected in each final model and the size of each model's input miRNA pool.
 ```{r holdout_evaluation, include=FALSE}
 
 final_filter_results <- train_filter_results
-final_fold_inputs <- prepare_fold_inputs(
+final_fold_inputs_by_model <- prepare_model_fold_inputs(
   train_set,
   holdout,
-  final_filter_results$selected
+  train_filter_results$stats
 )
 
+default_feature_pool_size <- if (include_limma_filter) {
+  length(select_top_limma_miRNA(
+    final_filter_results$stats,
+    p_value_threshold = limma_feature_p_value_threshold
+  )$miRNA)
+} else {
+  length(miRNA_all_columns)
+}
+tree_feature_pool_size <- length(miRNA_all_columns)
+
 cat(
-  "<p>Number of final ",
-  fold_filter_name,
-  " selected miRNAs: ",
-  length(final_filter_results$selected),
+  if (include_limma_filter) {
+    paste0(
+      "<p>Number of final ",
+      fold_filter_name,
+      " selected miRNAs supplied to the forward-step/lasso/elastic-net/LDA pool: "
+    )
+  } else {
+    "<p>Number of miRNAs supplied to the forward-step/lasso/elastic-net/LDA pool without limma filtering: "
+  },
+  default_feature_pool_size,
+  "; supplied to the random-forest/decision-tree pool (full miRNA set): ",
+  tree_feature_pool_size,
   "</p>\n",
   sep = ""
 )
 
-final_model_outputs <- run_active_models(final_fold_inputs)
+final_model_outputs <- run_active_models(final_fold_inputs_by_model)
+lasso_final_alpha <- final_model_outputs[["lasso"]]$final_alpha
 ```
 
 ```{r holdout_predictions, echo=FALSE, results='asis'}
@@ -633,7 +953,7 @@ final_model_outputs <- run_active_models(final_fold_inputs)
 holdout_predictions <- bind_rows(lapply(model_names, function(model_name) {
   data.frame(
     model = model_name,
-    observed = final_fold_inputs$valid_model_dat$CC_bin,
+    observed = final_fold_inputs_by_model[[model_name]]$valid_model_dat$CC_bin,
     prob = as.numeric(final_model_outputs[[model_name]]$prob),
     stringsAsFactors = FALSE
   )
@@ -641,6 +961,16 @@ holdout_predictions <- bind_rows(lapply(model_names, function(model_name) {
   mutate(
     predicted_class = if_else(.data$prob > 0.5, 1, 0)
   )
+
+for (model_name in model_names) {
+  model_holdout_predictions <- holdout_predictions %>%
+    filter(.data$model == model_name)
+
+  final_model_outputs[[model_name]]$confusion_matrix <- build_binary_confusion_summary(
+    observed = model_holdout_predictions$observed,
+    predicted_prob = model_holdout_predictions$prob
+  )
+}
 
 holdout_summary <- holdout_predictions %>%
   group_by(.data$model) %>%
@@ -671,7 +1001,7 @@ final_model_diagnostics <- bind_rows(lapply(model_names, function(model_name) {
 }))
 
 diagnostic_summary <- final_model_diagnostics %>%
-  dplyr::select(tidyselect::all_of(c("model", "n_prob", "n_selected_features")))
+  dplyr::select(tidyselect::all_of(c("model", "n_prob", "n_selected_miRNA")))
 
 render_html_table(
   diagnostic_summary,
@@ -679,12 +1009,559 @@ render_html_table(
 )
 
 holdout_feature_summary <- final_model_diagnostics %>%
-  dplyr::select(tidyselect::all_of(c("model", "n_selected_features")))
+  dplyr::select(tidyselect::all_of(c("model", "n_selected_miRNA")))
 
 render_html_table(
   holdout_feature_summary,
-  caption = "Selected feature counts in final holdout models"
+  caption = "Selected miRNA counts in final holdout models"
 )
+
+final_model_variable_summary <- bind_rows(lapply(model_names, function(model_name) {
+  model_out <- final_model_outputs[[model_name]]
+  selected_variables <- unique(model_out$selected_variables)
+  selected_demographics <- selected_variables[is_model_covariate_term(selected_variables)]
+  selected_miRNA <- selected_variables[!is_model_covariate_term(selected_variables)]
+
+  data.frame(
+    model = model_display_name(model_name),
+    n_final_variables = length(selected_variables),
+    demographic_variables = if (length(selected_demographics)) {
+      write_comma_separated_list(selected_demographics)
+    } else {
+      "None"
+    },
+    miRNA_variables = if (length(selected_miRNA)) {
+      write_comma_separated_list(selected_miRNA)
+    } else {
+      "None"
+    },
+    final_variables = if (length(selected_variables)) {
+      write_comma_separated_list(selected_variables)
+    } else {
+      "None"
+    },
+    stringsAsFactors = FALSE
+  )
+}))
+
+write.csv(
+  final_model_variable_summary,
+  "Tables/Final Model Variables.csv",
+  row.names = FALSE
+)
+
+render_html_table(
+  final_model_variable_summary,
+  caption = "Final variables used by each holdout model"
+)
+
+final_model_variable_long <- bind_rows(lapply(model_names, function(model_name) {
+  selected_variables <- unique(final_model_outputs[[model_name]]$selected_variables)
+
+  if (!length(selected_variables)) {
+    return(data.frame(
+      model = character(0),
+      variable = character(0),
+      variable_type = character(0),
+      stringsAsFactors = FALSE
+    ))
+  }
+
+  data.frame(
+    model = model_display_name(model_name),
+    variable = selected_variables,
+    variable_type = ifelse(
+      is_model_covariate_term(selected_variables),
+      "Demographic",
+      "miRNA"
+    ),
+    stringsAsFactors = FALSE
+  )
+}))
+
+final_variable_presence <- final_model_variable_long %>%
+  distinct(model, variable, .keep_all = TRUE) %>%
+  mutate(selected = "Yes") %>%
+  tidyr::pivot_wider(
+    names_from = model,
+    values_from = selected,
+    values_fill = ""
+  ) %>%
+  left_join(
+    final_model_variable_long %>%
+      distinct(model, variable, .keep_all = TRUE) %>%
+      count(variable, variable_type, name = "n_models_selected"),
+    by = c("variable", "variable_type")
+  ) %>%
+  mutate(
+    variable_type_order = if_else(.data$variable_type == "Demographic", 0L, 1L)
+  ) %>%
+  arrange(.data$variable_type_order, desc(.data$n_models_selected), .data$variable) %>%
+  dplyr::select(-.data$variable_type_order)
+
+write.csv(
+  final_variable_presence,
+  "Tables/Final Variable Inclusion Matrix.csv",
+  row.names = FALSE
+)
+
+render_html_table(
+  final_variable_presence,
+  caption = "Final variable inclusion matrix across holdout models"
+)
+
+final_model_variable_heatmap_counts <- final_model_variable_long %>%
+  distinct(model, variable, .keep_all = TRUE) %>%
+  count(variable, variable_type, name = "n_models_selected") %>%
+  arrange(desc(n_models_selected), variable_type, variable)
+
+if (!is.null(final_variable_heatmap_max_n) &&
+    (!is.numeric(final_variable_heatmap_max_n) || length(final_variable_heatmap_max_n) != 1L || final_variable_heatmap_max_n < 1)) {
+  stop("final_variable_heatmap_max_n must be NULL or a single positive number.")
+}
+
+final_variable_heatmap_top_n <- if (is.null(final_variable_heatmap_max_n)) {
+  nrow(final_model_variable_heatmap_counts)
+} else {
+  min(as.integer(final_variable_heatmap_max_n), nrow(final_model_variable_heatmap_counts))
+}
+
+final_variable_heatmap_subtitle <- if (final_variable_heatmap_top_n < nrow(final_model_variable_heatmap_counts)) {
+  paste(
+    "Top",
+    final_variable_heatmap_top_n,
+    "variables ordered by number of final models selecting them"
+  )
+} else {
+  "All final variables ordered by number of final models selecting them"
+}
+
+final_model_display_names <- vapply(model_names, model_display_name, character(1))
+
+final_variable_heatmap_variables <- final_model_variable_heatmap_counts %>%
+  slice_head(n = final_variable_heatmap_top_n) %>%
+  mutate(
+    variable_label = paste0(.data$variable, " (", .data$n_models_selected, ")")
+  )
+
+final_variable_heatmap_selected <- final_model_variable_long %>%
+  distinct(model, variable) %>%
+  mutate(selected = "Selected")
+
+final_variable_heatmap_data <- tidyr::expand_grid(
+  model = final_model_display_names,
+  variable = final_variable_heatmap_variables$variable
+) %>%
+  left_join(
+    final_variable_heatmap_variables,
+    by = "variable"
+  ) %>%
+  left_join(
+    final_variable_heatmap_selected,
+    by = c("model", "variable")
+  ) %>%
+  mutate(
+    selected = if_else(is.na(.data$selected), "Not selected", .data$selected),
+    model = factor(.data$model, levels = final_model_display_names),
+    variable_type = factor(.data$variable_type, levels = c("Demographic", "miRNA")),
+    variable_label = factor(
+      .data$variable_label,
+      levels = rev(final_variable_heatmap_variables$variable_label)
+    )
+  )
+
+final_variable_heatmap <- ggplot(
+  final_variable_heatmap_data,
+  aes(x = model, y = variable_label, fill = selected)
+) +
+  geom_tile(color = "white", linewidth = 0.6) +
+  facet_grid(variable_type ~ ., scales = "free_y", space = "free_y") +
+  scale_fill_manual(
+    values = c(
+      "Not selected" = "#ece8df",
+      "Selected" = "#0f5c78"
+    )
+  ) +
+  labs(
+    title = "Final Variable Selection Heatmap",
+    subtitle = final_variable_heatmap_subtitle,
+    x = "Model",
+    y = "Variable (number of models selecting it)",
+    fill = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 35, hjust = 1),
+    strip.text.y = element_text(angle = 0),
+    legend.position = "top"
+  )
+
+final_variable_heatmap_file <- file.path("Figures", "final_variable_selection_heatmap.png")
+
+save_plot(
+  filename = final_variable_heatmap_file,
+  plot = final_variable_heatmap,
+  width = 8,
+  height = max(5, 0.3 * nrow(final_variable_heatmap_variables) + 1.5)
+)
+
+cat(
+  sprintf(
+    '<img src="%s" alt="Final Variable Selection Heatmap" style="width:100%%; max-width:900px;" />\n\n',
+    final_variable_heatmap_file
+  )
+)
+
+```
+
+### Random Forest Out-of-Bag Error by Tree Count
+```{r rf_oob_error_curve, echo=FALSE, results='asis', fig.width=8, fig.height=6}
+
+rf_final_oob_error_curve <- final_model_outputs[["random_forest"]]$oob_error_curve
+
+# if (is.null(rf_final_oob_error_curve) || !nrow(rf_final_oob_error_curve)) {
+#   stop("The final random-forest model did not return OOB error by tree count.", call. = TRUE)
+# }
+
+rf_optimal_ntree <- final_model_outputs[["random_forest"]]$optimal_ntree
+
+if (is.null(rf_optimal_ntree) || !length(rf_optimal_ntree) || !is.finite(rf_optimal_ntree)) {
+  rf_optimal_ntree <- rf_final_oob_error_curve$n_trees[[which.min(rf_final_oob_error_curve$oob_error)]]
+}
+
+rf_optimal_oob_error <- rf_final_oob_error_curve$oob_error[[
+  match(rf_optimal_ntree, rf_final_oob_error_curve$n_trees)
+]]
+rf_optimal_oob_error_smoothed <- rf_final_oob_error_curve$oob_error_smoothed[[
+  match(rf_optimal_ntree, rf_final_oob_error_curve$n_trees)
+]]
+rf_best_mtry <- final_model_outputs[["random_forest"]]$tuning$mtry[[1]]
+rf_ntree_selection_burn_in <- final_model_outputs[["random_forest"]]$tuning$ntree_selection_burn_in[[1]]
+rf_ntree_smoothing_window <- final_model_outputs[["random_forest"]]$tuning$ntree_selection_smoothing_window[[1]]
+
+write.csv(
+  rf_final_oob_error_curve,
+  "Tables/Random Forest OOB Error by Tree Count.csv",
+  row.names = FALSE
+)
+
+cat(
+  sprintf(
+    "<p>For the best random-forest fit at mtry = %d, the final tree count was set to %d using the minimum %d-tree moving-average OOB classification error after a %d-tree burn-in. The selected forest had raw OOB classification error %.3f and smoothed OOB classification error %.3f.</p>\n",
+    rf_best_mtry,
+    rf_optimal_ntree,
+    rf_ntree_smoothing_window,
+    rf_ntree_selection_burn_in,
+    rf_optimal_oob_error,
+    rf_optimal_oob_error_smoothed
+  )
+)
+
+rf_oob_error_curve_plot <- ggplot(
+  rf_final_oob_error_curve,
+  aes(x = .data$n_trees)
+) +
+  geom_line(aes(y = .data$oob_error), color = "#A6CEE3", linewidth = 0.8, alpha = 0.9) +
+  geom_line(aes(y = .data$oob_error_smoothed), color = "#2C7FB8", linewidth = 1) +
+  geom_vline(xintercept = rf_ntree_selection_burn_in, linetype = "dotted", color = "gray50") +
+  geom_vline(xintercept = rf_optimal_ntree, linetype = "dashed", color = "#C65D3B") +
+  geom_point(
+    data = rf_final_oob_error_curve %>% filter(.data$n_trees == rf_optimal_ntree),
+    aes(y = .data$oob_error_smoothed),
+    color = "#C65D3B",
+    size = 2.5
+  ) +
+  labs(
+    title = "Random Forest OOB Classification Error by Tree Count",
+    subtitle = sprintf(
+      "Best mtry = %d; selected at %d trees after %d-tree burn-in; dark line = %d-tree moving average",
+      rf_best_mtry,
+      rf_optimal_ntree,
+      rf_ntree_selection_burn_in,
+      rf_ntree_smoothing_window
+    ),
+    x = "Number of Trees",
+    y = "Out-of-Bag Classification Error"
+  ) +
+  theme_minimal()
+
+rf_oob_error_curve_plot_file <- file.path("Figures", "random_forest_oob_error_by_tree_count.png")
+
+save_plot(
+  filename = rf_oob_error_curve_plot_file,
+  plot = rf_oob_error_curve_plot,
+  width = 8,
+  height = 6
+)
+
+cat(
+  sprintf(
+    '<img src="%s" alt="Random Forest OOB Classification Error by Tree Count" style="width:100%%; max-width:900px;" />\n\n',
+    rf_oob_error_curve_plot_file
+  )
+)
+
+```
+
+### Random Forest Feature Importance
+Rank the final random-forest miRNA candidates by holdout-model feature importance and retain the top M miRNA as the final RF miRNA list.
+
+```{r random_forest_feature_importance, echo=FALSE, results='asis', fig.width=8, fig.height=6}
+
+rf_final_importance <- final_model_outputs[["random_forest"]]$feature_importance
+rf_final_importance_miRNA <- rf_final_importance %>%
+  filter(.data$variable_type == "miRNA")
+
+if (!nrow(rf_final_importance_miRNA)) {
+  stop("The final random-forest model did not return any miRNA feature-importance values.", call. = TRUE)
+}
+
+rf_final_selected_miRNA <- rf_final_importance_miRNA %>%
+  filter(.data$selected_for_final)
+
+rf_importance_rows_to_show <- min(
+  rf_importance_plot_top_n,
+  nrow(rf_final_importance_miRNA)
+)
+
+write.csv(
+  rf_final_importance,
+  "Tables/Random Forest Feature Importance.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  rf_final_selected_miRNA,
+  "Tables/Random Forest Top Ranked miRNA.csv",
+  row.names = FALSE
+)
+
+cat(
+  sprintf(
+    "<p>The final random-forest miRNA list keeps the top %d miRNA ranked by %s from the refit forest using mtry = %d and ntree = %d.</p>\n",
+    nrow(rf_final_selected_miRNA),
+    rf_final_importance_miRNA$importance_metric[[1]],
+    final_model_outputs[["random_forest"]]$tuning$mtry[[1]],
+    final_model_outputs[["random_forest"]]$tuning$ntree[[1]]
+  )
+)
+
+rf_feature_importance_table <- rf_final_importance_miRNA %>%
+  slice_head(n = rf_importance_rows_to_show) %>%
+  mutate(selected_for_final = if_else(.data$selected_for_final, "Yes", "No")) %>%
+  dplyr::select(
+    importance_rank,
+    variable,
+    importance_value,
+    MeanDecreaseAccuracy,
+    MeanDecreaseGini,
+    selected_for_final
+  )
+
+render_html_table(
+  rf_feature_importance_table,
+  caption = "Random-forest miRNA feature-importance ranking on the final holdout model",
+  digits = 3
+)
+
+rf_feature_importance_plot_data <- rf_final_importance_miRNA %>%
+  slice_head(n = rf_importance_rows_to_show) %>%
+  mutate(
+    selected_for_final = if_else(.data$selected_for_final, "Top M retained", "Ranked only"),
+    variable = factor(.data$variable, levels = rev(.data$variable))
+  )
+
+rf_feature_importance_plot <- ggplot(
+  rf_feature_importance_plot_data,
+  aes(x = .data$variable, y = .data$importance_value, fill = .data$selected_for_final)
+) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_manual(values = c("Top M retained" = "#2C7FB8", "Ranked only" = "#B7D4E8")) +
+  labs(
+    title = "Random Forest miRNA Feature Importance",
+    subtitle = sprintf("Ranked by %s", rf_final_importance_miRNA$importance_metric[[1]]),
+    x = NULL,
+    y = rf_final_importance_miRNA$importance_metric[[1]],
+    fill = NULL
+  ) +
+  theme_minimal()
+
+rf_feature_importance_plot_file <- file.path("Figures", "random_forest_feature_importance.png")
+
+save_plot(
+  filename = rf_feature_importance_plot_file,
+  plot = rf_feature_importance_plot,
+  width = 8,
+  height = max(5, 0.3 * nrow(rf_feature_importance_plot_data) + 1.5)
+)
+
+cat(
+  sprintf(
+    '<img src="%s" alt="Random Forest Feature Importance" style="width:100%%; max-width:900px;" />\n\n',
+    rf_feature_importance_plot_file
+  )
+)
+
+```
+
+### Decision Tree Cross-Validated Classification Error
+```{r cv_classification_error_plots, fig.height=6, fig.width=8, echo=FALSE}
+
+dt_cv_classification_error <- final_model_outputs[["decision_tree"]]$cv_classification_error
+
+if (is.null(dt_cv_classification_error) || !nrow(dt_cv_classification_error)) {
+  stop("The final decision-tree model did not return cross-validated classification error by tree size.", call. = TRUE)
+}
+
+write.csv(
+  dt_cv_classification_error,
+  "Tables/Decision Tree Cross-Validated Classification Error by Tree Size.csv",
+  row.names = FALSE
+)
+
+dt_cv_classification_error_plot_file <- file.path(
+  "Figures",
+  "decision_tree_cv_classification_error_rate.png"
+)
+
+plot_dt_cv_classification_error <- function() {
+  plot(
+    dt_cv_classification_error$tree_size,
+    dt_cv_classification_error$cv_classification_error_rate,
+    type = "b",
+    xlab = "Tree Size",
+    ylab = "Cross-Validated Classification Error Rate",
+    main = "Decision Tree Cross-Validated Classification Error"
+  )
+}
+
+grDevices::png(
+  filename = dt_cv_classification_error_plot_file,
+  width = 800,
+  height = 600,
+  res = 120
+)
+plot_dt_cv_classification_error()
+invisible(grDevices::dev.off())
+
+plot_dt_cv_classification_error()
+
+optimal_size <- dt_cv_classification_error$tree_size[
+  which.min(dt_cv_classification_error$cv_classification_error_rate)
+]
+
+```
+We use a minimizing function to select the optimal tree size, which is `r optimal_size`.
+
+### Lasso and Elastic Net Alpha Settings
+The penalized logistic-model helpers use `glmnet`-based tuning on the training data. The lasso fit uses `alpha = 1`, and the elastic-net fit selects the alpha value with the lowest cross-validated deviance over the predefined alpha grid.
+```{r lasso_elastic_net_optimal_alpha, echo=FALSE}
+
+lasso_final_alpha <- final_model_outputs[["lasso"]]$final_alpha
+enet_final_alpha <- final_model_outputs[["elastic_net"]]$final_alpha
+
+cat(sprintf("The alpha used for the Lasso model is %f.\n", lasso_final_alpha))
+cat(sprintf("The selected alpha for the Elastic Net model is %f.\n", enet_final_alpha))
+
+```
+
+### Decision Tree Feature Importance
+For the decision tree, we define selected miRNA as miRNA that appear in one or more primary splits of the final fitted tree, and we separately report the tree's variable-importance ranking.
+
+```{r decision_tree_feature_importance, echo=FALSE, results='asis', fig.width=8, fig.height=6}
+
+dt_final_importance <- final_model_outputs[["decision_tree"]]$feature_importance
+dt_final_importance_miRNA <- dt_final_importance %>%
+  filter(.data$variable_type == "miRNA")
+
+write.csv(
+  dt_final_importance,
+  "Tables/Decision Tree Feature Importance.csv",
+  row.names = FALSE
+)
+
+if (!nrow(dt_final_importance_miRNA)) {
+  cat("<p>The final decision tree did not return any miRNA used in primary splits or any miRNA with nonzero importance.</p>\n")
+} else {
+  dt_final_selected_miRNA <- dt_final_importance_miRNA %>%
+    filter(.data$selected_for_final)
+
+  dt_importance_rows_to_show <- min(
+    dt_importance_plot_top_n,
+    nrow(dt_final_importance_miRNA)
+  )
+
+  write.csv(
+    dt_final_selected_miRNA,
+    "Tables/Decision Tree Split Selected miRNA.csv",
+    row.names = FALSE
+  )
+
+  cat(
+    paste0(
+      "<p>For the decision tree, miRNA were considered selected only if they appeared in one or more primary splits of the final tree. ",
+      "The ranking below summarizes each miRNA's total loss reduction across the fitted tree and distinguishes miRNA used in primary splits from miRNA with nonzero importance only.</p>\n"
+    )
+  )
+
+  dt_feature_importance_table <- dt_final_importance_miRNA %>%
+    slice_head(n = dt_importance_rows_to_show) %>%
+    mutate(selected_for_final = if_else(.data$selected_for_final, "Yes", "No")) %>%
+    dplyr::select(
+      importance_rank,
+      variable,
+      importance_value,
+      primary_split_count,
+      selected_for_final
+    )
+
+  render_html_table(
+    dt_feature_importance_table,
+    caption = "Decision-tree miRNA feature-importance ranking on the final holdout model",
+    digits = 3
+  )
+
+  dt_feature_importance_plot_data <- dt_final_importance_miRNA %>%
+    slice_head(n = dt_importance_rows_to_show) %>%
+    mutate(
+      selected_for_final = if_else(.data$selected_for_final, "Used in tree", "Importance only"),
+      variable = factor(.data$variable, levels = rev(.data$variable))
+    )
+
+  dt_feature_importance_plot <- ggplot(
+    dt_feature_importance_plot_data,
+    aes(x = .data$variable, y = .data$importance_value, fill = .data$selected_for_final)
+  ) +
+    geom_col() +
+    coord_flip() +
+    scale_fill_manual(values = c("Used in tree" = "#2C7FB8", "Importance only" = "#B7D4E8")) +
+    labs(
+      title = "Decision Tree miRNA Feature Importance",
+      subtitle = "Ranked by total loss reduction in the final fitted tree",
+      x = NULL,
+      y = "TotalLossReduction",
+      fill = NULL
+    ) +
+    theme_minimal()
+
+  dt_feature_importance_plot_file <- file.path("Figures", "decision_tree_feature_importance.png")
+
+  save_plot(
+    filename = dt_feature_importance_plot_file,
+    plot = dt_feature_importance_plot,
+    width = 8,
+    height = max(5, 0.3 * nrow(dt_feature_importance_plot_data) + 1.5)
+  )
+
+  cat(
+    sprintf(
+      '<img src="%s" alt="Decision Tree Feature Importance" style="width:100%%; max-width:900px;" />\n\n',
+      dt_feature_importance_plot_file
+    )
+  )
+}
 
 ```
 
@@ -788,7 +1665,7 @@ render_html_table(
 )
 
 roc_curves <- lapply(model_names, function(model_name) {
-  roc(final_fold_inputs$valid_model_dat$CC_bin, final_model_outputs[[model_name]]$prob, quiet = TRUE)
+  roc(final_fold_inputs_by_model[[model_name]]$valid_model_dat$CC_bin, final_model_outputs[[model_name]]$prob, quiet = TRUE)
 })
 names(roc_curves) <- model_names
 
@@ -843,14 +1720,89 @@ cat(
 
 ```
 
+## Confusion Matrices for Final Models
+```{r confusion_matrices, echo=FALSE, results='asis'}
+
+confusion_matrices <- lapply(model_names, function(model_name) {
+  model_outputs <- final_model_outputs[[model_name]]
+  if (is.null(model_outputs$confusion_matrix)) {
+    return(NULL)
+  }
+
+  cm <- model_outputs$confusion_matrix
+  cm_table <- as.data.frame(cm$table)
+  cm_table$model <- model_name
+  cm_table
+})
+
+confusion_matrices <- bind_rows(confusion_matrices)
+
+write.csv(confusion_matrices, "Tables/Confusion Matrices.csv", row.names = FALSE)
+
+render_html_table(
+  confusion_matrices,
+  caption = "Confusion Matrices for Final Models"
+)
+
+```
+
+## Classification Metrics for Final Models
+
+```{r precision_recall_f1, echo=FALSE, results='asis'}
+
+precision_recall_f1_summary <- bind_rows(lapply(model_names, function(model_name) {
+  model_outputs <- final_model_outputs[[model_name]]
+  if (is.null(model_outputs$confusion_matrix)) {
+    return(data.frame(
+      model = model_name,
+      precision = NA_real_,
+      recall = NA_real_,
+      sensitivity = NA_real_,
+      specificity = NA_real_,
+      accuracy = NA_real_,
+      f1_score = NA_real_
+    ))
+  }
+
+  cm <- model_outputs$confusion_matrix
+  precision <- cm$byClass["Precision"]
+  recall <- cm$byClass["Recall"]
+  sensitivity <- cm$byClass["Sensitivity"]
+  specificity <- cm$byClass["Specificity"]
+  accuracy <- cm$byClass["Accuracy"]
+  f1_score <- cm$byClass["F1"]
+
+  data.frame(
+    model = model_name,
+    precision = precision,
+    recall = recall,
+    sensitivity = sensitivity,
+    specificity = specificity,
+    accuracy = accuracy,
+    f1_score = f1_score
+  )
+}))
+
+write.csv(precision_recall_f1_summary, "Tables/Precision_Recall_F1_Summary.csv", row.names = FALSE)
+
+render_html_table(
+  precision_recall_f1_summary,
+  caption = "Precision, Recall, Sensitivity, Specificity, Accuracy, and F1 Score for Final Models",
+  digits = 3
+)
+
+```
+
 # Selected miRNA Features and Interpretation
 
-```{r final_selected_features, echo=FALSE, results='asis'}
+## Final selected miRNA across non-tree models
 
-# final feature counts across all models:
-# create a table of all miRNA features selected by any final model, with a count of how many models selected each feature, sorted by count and then alphabetically
-final_selected_features <- bind_rows(lapply(model_names, function(model_name) {
-  model_selected <- final_model_outputs[[model_name]]$selected_features
+```{r final_selected_miRNA, echo=FALSE, results='asis'}
+
+# final feature counts across the non-tree models:
+# create a table of all miRNA features selected by any non-tree final model, with a count of how many non-tree models selected each feature, sorted by count and then alphabetically
+final_selected_miRNA <- bind_rows(lapply(consensus_model_names, function(model_name) {
+  model_selected <- final_model_outputs[[model_name]]$selected_miRNA
 
   if (is.null(model_selected) || !length(model_selected)) {
     return(data.frame(
@@ -867,7 +1819,7 @@ final_selected_features <- bind_rows(lapply(model_names, function(model_name) {
   )
 }))
 
-final_model_feature_counts <- final_selected_features %>%
+final_model_feature_counts <- final_selected_miRNA %>%
   distinct(model, miRNA) %>%
   count(miRNA, name = "n_models_selected") %>%
   arrange(desc(n_models_selected), miRNA)
@@ -876,11 +1828,11 @@ write.csv(final_model_feature_counts, "Tables/Final Model Feature Counts.csv", r
 
 render_html_table(
   final_model_feature_counts,
-  caption = "Counts of models selecting each miRNA"
+  caption = "Counts of non-tree models selecting each miRNA"
 )
 
 if (nrow(final_model_feature_counts) == 0) {
-  stop("No miRNAs were selected by any final model.", call. = TRUE)
+  stop("No miRNAs were selected by any non-tree final model.", call. = TRUE)
 }
 
 final_filter_stats <- final_filter_results$stats
@@ -920,15 +1872,12 @@ top_ranked_miRNA_details$multiMiR_query_id <- vapply(
   }
 )
 
-top_ranked_consensus_miRNA <- top_ranked_miRNA_details %>%
-  slice_head(n = 1)
-
 cat(
   "<p>Top-rank selection count: ",
   top_rank_count,
   " of ",
-  length(model_names),
-  " models</p>\n",
+  length(consensus_model_names),
+  " non-tree models</p>\n",
   sep = ""
 )
 
@@ -943,125 +1892,223 @@ render_html_table(
       limma_p_value,
       limma_adj_p_value
     ),
-  caption = "Top-ranked consensus miRNAs"
+  caption = "Top-ranked consensus miRNAs from the non-tree models"
+)
+
+cat(
+  "<p>Downstream multiMiR analysis uses all ",
+  nrow(top_ranked_miRNA_details),
+  " miRNAs in this non-tree consensus set.</p>\n",
+  sep = ""
 )
 
 if (nrow(top_ranked_miRNA_details) > 1) {
   cat(
     paste0(
-      "<p>Multiple miRNAs tied for the highest model-selection count, ",
+      "<p>Multiple miRNAs tied for the highest non-tree model-selection count, ",
       "so the table below is ordered by the smallest blocked-limma p-value, ",
       "with ties broken by the absolute moderated t-statistic and then miRNA identifier. ",
-      "The first row is the top-ranked consensus miRNA used for downstream annotation.</p>\n"
+      "All rows in this table are used for downstream multiMiR annotation.</p>\n"
     )
   )
 }
 
 ```
 
-## miRNA Interactions
-Assess validated target and disease/drug associations for the top-ranked consensus miRNA with multiMiR.
-```{r multi_mir_analysis, eval=FALSE, echo=FALSE, results='asis'}
+## Final selected variables across non-tree models
+```{r final_selected_variables, echo=FALSE, results='asis'}
 
-source("R/multi_mir_analysis.r", local = environment())
+# final feature counts across the non-tree models:
+# create a table of all features selected by any non-tree final model, with a count of how many non-tree models selected each feature, sorted by count and then alphabetically
+final_selected_variables <- bind_rows(lapply(consensus_model_names, function(model_name) {
+  model_selected <- final_model_outputs[[model_name]]$selected_variables
 
-```
+  if (is.null(model_selected) || !length(model_selected)) {
+    return(data.frame(
+      model = character(0),
+      variable = character(0),
+      stringsAsFactors = FALSE
+    ))
+  }
 
-
-
-# Final Summary Table of the Top-Ranked Consensus miRNAs
-A table of the top-ranked consensus miRNAs with their blocked-limma statistics, model selection counts, and annotation names.
-
-```{r consensus_features, echo=FALSE, results='asis'}
-
-final_feature_table <- top_ranked_miRNA_details %>%
-  dplyr::select(
-    miRNA,
-    Annotation,
-    multiMiR_query_id,
-    n_models_selected,
-    tidyselect::all_of(filter_stat_cols[filter_stat_cols != "miRNA"])
+  data.frame(
+    model = rep(model_name, length(model_selected)),
+    variable = model_selected,
+    stringsAsFactors = FALSE
   )
+}))
 
-write.csv(final_feature_table, "Tables/Final Consensus Features.csv", row.names = FALSE)
+final_model_variable_counts <- final_selected_variables %>%
+  distinct(model, variable) %>%
+  mutate(
+    variable_type = if_else(is_model_covariate_term(.data$variable), "Demographic", "miRNA")
+  ) %>%
+  count(variable, variable_type, name = "n_models_selected") %>%
+  arrange(desc(n_models_selected), variable_type, variable)
+
+write.csv(final_model_variable_counts, "Tables/Final Variable Counts.csv", row.names = FALSE)
 
 render_html_table(
-  final_feature_table,
-  caption = "Top-ranked consensus miRNAs summary",
-  digits = 3
+  final_model_variable_counts,
+  caption = "Counts of non-tree models selecting each variable"
 )
+
+if (nrow(final_model_variable_counts) == 0) {
+  stop("No variables were selected by any non-tree final model.", call. = TRUE)
+}
+
+final_filter_stats <- final_filter_results$stats
+
+gpl <- read_tsv(
+  gene_family_file,
+  col_names = c("Annotation", "Alias", "MIMAT", "ClassName"),
+  show_col_types = FALSE
+)
+
+annotation_lookup <- gpl %>%
+  distinct(.data$MIMAT, .keep_all = TRUE) %>%
+  transmute(
+    miRNA = .data$MIMAT,
+    Annotation = .data$Annotation
+  )
+
+top_ranked_variable <- final_model_variable_counts %>%
+  slice_max(order_by = n_models_selected, n = 1, with_ties = TRUE) %>%
+  arrange(variable_type, variable)
+top_rank_count <- top_ranked_variable$n_models_selected[[1]]
+
+top_ranked_variable_details <- top_ranked_variable %>%
+  mutate(
+    miRNA = if_else(.data$variable_type == "miRNA", .data$variable, NA_character_)
+  ) %>%
+  left_join(final_filter_stats[, filter_stat_cols], by = "miRNA") %>%
+  left_join(annotation_lookup, by = "miRNA") %>%
+  mutate(
+    Annotation = if_else(
+      .data$variable_type == "Demographic",
+      "Demographic covariate",
+      .data$Annotation
+    )
+  ) %>%
+  arrange(is.na(.data$limma_p_value), .data$limma_p_value, desc(abs(.data$limma_t)), .data$variable)
+
+top_ranked_variable_details$multiMiR_query_id <- vapply(
+  top_ranked_variable_details$Annotation,
+  FUN.VALUE = character(1),
+  function(annotation_value) {
+    if (is.na(annotation_value) || !nzchar(annotation_value)) {
+      return(NA_character_)
+    }
+
+    trimws(strsplit(annotation_value, ",", fixed = TRUE)[[1]][[1]])
+  }
+)
+
+top_ranked_consensus_variable <- top_ranked_variable_details %>%
+  slice_head(n = 1)
+
+cat(
+  "<p>Top-rank selection count: ",
+  top_rank_count,
+  " of ",
+  length(consensus_model_names),
+  " non-tree models</p>\n",
+  sep = ""
+)
+
+render_html_table(
+  top_ranked_variable_details %>%
+    dplyr::select(
+      variable,
+      variable_type,
+      Annotation,
+      n_models_selected,
+      limma_log_fc,
+      limma_t,
+      limma_p_value,
+      limma_adj_p_value
+    ),
+  caption = "Top-ranked consensus variables from the non-tree models"
+)
+
+if (nrow(top_ranked_variable_details) > 1) {
+  cat(
+    paste0(
+      "<p>Multiple variables tied for the highest non-tree model-selection count, ",
+      "so miRNA variables in the table below are ordered by the smallest blocked-limma p-value, ",
+      "with ties broken by the absolute moderated t-statistic and then variable identifier. ",
+      "Demographic covariates do not have blocked-limma statistics and are listed after miRNA variables. ",
+      "The first row is the top-ranked consensus variable used for downstream annotation.</p>\n"
+    )
+  )
+}
 
 ```
 
-## Blocked-limma Summary Plot of Top-Ranked Consensus miRNAs
-Blocked-limma summary of the top-ranked consensus miRNAs.
-```{r final_limma_summary_plot, echo=FALSE, results='asis', fig.width=7, fig.height=5}
+## Comparison of Top-Ranked miRNA by Decision Tree and Random Forest
+Limited to top 20 miRNAs for visualization.
+```{r comparison_tree_features, fig.height=6, fig.width=8}
 
-limma_plot_data <- top_ranked_miRNA_details %>%
-  mutate(
-    plot_p_value = pmax(.data$limma_p_value, .Machine$double.xmin),
-    plot_label = if_else(!is.na(.data$Annotation) & .data$Annotation != "", .data$Annotation, .data$miRNA)
-  )
+decision_tree_top_miRNA <- final_model_outputs[["decision_tree"]]$selected_miRNA
+random_forest_top_miRNA <- final_model_outputs[["random_forest"]]$selected_miRNA
+decision_tree_top_miRNA <- head(decision_tree_top_miRNA, 20)
+random_forest_top_miRNA <- head(random_forest_top_miRNA, 20)
 
-limma_summary_plot <- ggplot(
-  limma_plot_data,
-  aes(x = limma_log_fc, y = -log10(plot_p_value), color = limma_t)
-) +
-  geom_point(size = 3) +
-  geom_text(aes(label = plot_label), nudge_y = 0.1, check_overlap = TRUE, size = 3) +
-  scale_color_gradient2(low = "blue", mid = "grey90", high = "red", midpoint = 0, na.value = "grey") +
-  labs(
-    title = "Blocked-limma Summary of Top-Ranked Consensus miRNAs",
-    x = "Limma logFC",
-    y = "-Log10 limma P-Value",
-    color = "Limma t"
-  ) +
-  theme_minimal()
-
-association_plot_file <- "Figures/Blocked Limma Summary Top Consensus miRNAs.png"
-
-save_plot(
-  filename = association_plot_file,
-  plot = limma_summary_plot,
+comparison_df <- tibble(
+  miRNA = union(decision_tree_top_miRNA, random_forest_top_miRNA),
+  Decision_Tree = miRNA %in% decision_tree_top_miRNA,
+  Random_Forest = miRNA %in% random_forest_top_miRNA
 )
 
-cat(
-  sprintf(
-    '<img src="%s" alt="Blocked-limma Summary of Top-Ranked Consensus miRNAs" style="width:100%%; max-width:700px;" />\n\n',
-    association_plot_file
-  )
+comparison_df_long <- comparison_df %>%
+  pivot_longer(cols = c("Decision_Tree", "Random_Forest"), names_to = "Model", values_to = "Selected")
+
+ggplot(comparison_df_long, aes(x = Model, y = miRNA, fill = Selected)) +
+  geom_tile(color = "white") +
+  scale_fill_manual(values = c("TRUE" = "steelblue", "FALSE" = "grey90")) +
+  theme_minimal() +
+  labs(title = "Comparison of Top-Ranked miRNA by Decision Tree and Random Forest", x = "Model", y = "miRNA")
+
+```
+
+## Merging of Selected and Ranked Features by All Models
+We will take the top 5 consensus miRNA features from the non tree-based models and merge them with the top 5 features from the decision tree and random forest models to create a comprehensive set of top-ranked features for further analysis.
+```{r merge_top_features, echo=FALSE}
+
+top_5_consensus_miRNA <- top_ranked_variable_details %>%
+  filter(variable_type == "miRNA") %>%
+  slice_head(n = 5) %>%
+  pull(variable)
+
+top_5_decision_tree_miRNA <- final_model_outputs[["decision_tree"]]$selected_miRNA %>%
+  head(5)
+
+top_5_random_forest_miRNA <- final_model_outputs[["random_forest"]]$selected_miRNA %>%
+  head(5)
+
+merged_top_features <- union(
+  union(top_5_consensus_miRNA, top_5_decision_tree_miRNA),
+  top_5_random_forest_miRNA
+)
+
+merged_top_features
+
+```
+
+```{r store_downstream_analysis_inputs, include=FALSE}
+
+saveRDS(
+  list(
+    top_ranked_miRNA_details = top_ranked_miRNA_details,
+    merged_top_features = merged_top_features
+  ),
+  downstream_analysis_inputs_rds_file
 )
 
 ```
 
 ```{r final_report_conclusion, echo=FALSE, results='asis'}
 
-if (!exists("report_start_time", inherits = TRUE)) {
-  cat("<p>Elapsed runtime was not available because the start timestamp was not initialized.</p>\n")
-} else {
-  report_end_time <- Sys.time()
-  elapsed_seconds <- as.numeric(difftime(report_end_time, report_start_time, units = "secs"))
-
-  format_elapsed_time <- function(elapsed_seconds) {
-    total_seconds <- max(0L, as.integer(round(elapsed_seconds)))
-    hours <- total_seconds %/% 3600L
-    minutes <- (total_seconds %% 3600L) %/% 60L
-    seconds <- total_seconds %% 60L
-
-    sprintf("%02d:%02d:%02d", hours, minutes, seconds)
-  }
-
-  cat(
-    paste0(
-      "<p>Report runtime: ",
-      format_elapsed_time(elapsed_seconds),
-      " (started ",
-      format(report_start_time, "%Y-%m-%d %H:%M:%S"),
-      "; finished ",
-      format(report_end_time, "%Y-%m-%d %H:%M:%S"),
-      ").</p>\n"
-    )
-  )
-}
+render_report_runtime(report_start_time)
 
 ```

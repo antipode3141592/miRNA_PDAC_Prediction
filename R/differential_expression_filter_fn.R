@@ -3,6 +3,7 @@ differential_expression_filter_fn <- function(
   miRNA_cols,
   filter_stat_cols,
   top_n = 50,
+  p_value_threshold = NULL,
   group_term = "CC",
   adjustment_covariates = c("Sex", "Race", "Age"),
   coef_name = "CCPDAC case"
@@ -13,6 +14,13 @@ differential_expression_filter_fn <- function(
 
   if (!length(filter_stat_cols)) {
     stop("filter_stat_cols must be provided to the blocked limma filter.", call. = TRUE)
+  }
+
+  if (!is.null(p_value_threshold)) {
+    if (!is.numeric(p_value_threshold) || length(p_value_threshold) != 1L ||
+        !is.finite(p_value_threshold) || p_value_threshold <= 0 || p_value_threshold > 1) {
+      stop("p_value_threshold must be a single numeric value in the interval (0, 1].", call. = TRUE)
+    }
   }
 
   case_expr <- train_fold_dat[train_fold_dat$CC == "PDAC case", miRNA_cols, drop = FALSE]
@@ -89,8 +97,14 @@ differential_expression_filter_fn <- function(
     stop("Blocked limma filter returned zero usable miRNAs.", call. = TRUE)
   }
 
-  selected <- class_stats |>
-    dplyr::slice_head(n = top_n) |>
+  selected_stats <- if (!is.null(p_value_threshold)) {
+    class_stats[class_stats$limma_p_value < p_value_threshold, , drop = FALSE]
+  } else {
+    class_stats |>
+      dplyr::slice_head(n = top_n)
+  }
+
+  selected <- selected_stats |>
     dplyr::pull("miRNA")
 
   if (!length(selected)) {

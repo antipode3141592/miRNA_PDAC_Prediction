@@ -1,0 +1,289 @@
+---
+title: "Final Project - Predicting PDAC with Circulating miRNA - RF Only"
+authors: "Madison Blake, Kristyn Gumpper-Fedus, Sean Kirkpatrick"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Predicting PDAC with Circulating miRNA - Random Forest Only
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE
+)
+
+dir.create("Data", showWarnings = FALSE, recursive = TRUE)
+
+source("R/model_only_report_helpers.R")
+source("R/run_fold_rf.R")
+source("R/run_limma_paired.R")
+source("R/differential_expression_filter_fn.R")
+```
+
+```{r constants, include=FALSE}
+set.seed(31415)
+
+normalized_data_file <- "Data/GSE314577/GSE314577_VUMC_miRNA_normalized_data.xlsx"
+metadata_file <- "Data/GSE314577/GSE314577_VUMC_Metadata_ch_revised.xlsx"
+limma_rds_file <- "Data/Full train_filter_results.rds"
+
+log2_pseudocount <- 1
+run_limma_analysis <- FALSE
+train_fraction <- 0.8
+k <- 5
+
+fold_filter_top_n <- 25
+rf_ntree <- 1000
+rf_mtry_grid <- c(5L, 10L, 20L, 30L)
+rf_top_m_features <- 10
+rf_importance_metric <- "MeanDecreaseAccuracy"
+rf_importance_plot_top_n <- max(20L, rf_top_m_features)
+
+demographic_covariates <- c("Sex", "Race", "Age")
+factor_demographic_covariates <- c("Sex", "Race")
+use_model_covariates <- TRUE
+model_covariates <- if (use_model_covariates) demographic_covariates else character(0)
+
+limma_group_term <- "CC"
+limma_adjustment_covariates <- demographic_covariates
+filter_stat_cols <- c(
+  "miRNA",
+  "mean_control",
+  "mean_case",
+  "mean_diff",
+  "limma_log_fc",
+  "limma_avg_expr",
+  "limma_t",
+  "limma_p_value",
+  "limma_adj_p_value",
+  "limma_b"
+)
+```
+
+```{r shared_inputs, include=FALSE}
+analysis_inputs <- load_model_only_pipeline_data(
+  normalized_data_file = normalized_data_file,
+  metadata_file = metadata_file,
+  log2_pseudocount = log2_pseudocount,
+  train_fraction = train_fraction,
+  run_limma_analysis = run_limma_analysis,
+  limma_rds_file = limma_rds_file,
+  filter_stat_cols = filter_stat_cols,
+  fold_filter_top_n = fold_filter_top_n,
+  limma_group_term = limma_group_term,
+  limma_adjustment_covariates = limma_adjustment_covariates
+)
+
+train_set <- analysis_inputs$train_set
+holdout <- analysis_inputs$holdout
+train_filter_results <- analysis_inputs$train_filter_results
+miRNA_all_columns <- analysis_inputs$miRNA_all_columns
+```
+
+```{r model_feature_pool, include=FALSE}
+rf_selected_miRNA <- miRNA_all_columns
+```
+
+```{r model_run, include=FALSE}
+model_runner <- function(fold_inputs) {
+  rf_runner <- get("run_fold_rf", mode = "function")
+
+  rf_runner(
+    fold_inputs,
+    ntree = rf_ntree,
+    mtry_grid = rf_mtry_grid,
+    top_m_features = rf_top_m_features,
+    importance_metric = rf_importance_metric
+  )
+}
+
+cv_results <- run_single_model_cv(
+  train_set = train_set,
+  k = k,
+  selected_miRNA = rf_selected_miRNA,
+  model_name = "random_forest",
+  model_runner = model_runner,
+  model_covariates = model_covariates,
+  factor_model_covariates = factor_demographic_covariates
+)
+
+holdout_results <- run_single_model_holdout(
+  train_set = train_set,
+  holdout = holdout,
+  selected_miRNA = rf_selected_miRNA,
+  model_name = "random_forest",
+  model_runner = model_runner,
+  model_covariates = model_covariates,
+  factor_model_covariates = factor_demographic_covariates
+)
+```
+
+```{r final_objects, include=FALSE}
+rf_results <- list(
+  train_filter_results = train_filter_results,
+  preselected_miRNA = rf_selected_miRNA,
+  selected_miRNA = holdout_results$final_model_output$selected_miRNA,
+  cv_predictions = cv_results$cv_predictions,
+  cv_tuning = cv_results$cv_tuning,
+  cv_feature_counts = cv_results$cv_feature_counts,
+  cv_preselected_feature_counts = cv_results$cv_preselected_feature_counts,
+  cv_selected_variables = cv_results$cv_selected_variables,
+  cv_selected_miRNA = cv_results$cv_selected_miRNA,
+  cv_feature_importance = cv_results$cv_feature_importance,
+  cv_summary = cv_results$cv_summary,
+  holdout_roc = holdout_results$holdout_roc,
+  holdout_predictions = holdout_results$holdout_predictions,
+  holdout_summary = holdout_results$holdout_summary,
+  final_fold_inputs = holdout_results$final_fold_inputs,
+  final_model_output = holdout_results$final_model_output,
+  feature_importance = holdout_results$final_model_output$feature_importance
+)
+```
+
+## Random Forest Out-of-Bag Error by Tree Count
+
+```{r rf_oob_error_curve, echo=FALSE, results='asis', fig.width=8, fig.height=6}
+rf_final_oob_error_curve <- holdout_results$final_model_output$oob_error_curve
+
+if (is.null(rf_final_oob_error_curve) || !nrow(rf_final_oob_error_curve)) {
+  cat("<p>The final random-forest model did not return OOB error by tree count.</p>\n")
+} else {
+  rf_optimal_ntree <- holdout_results$final_model_output$optimal_ntree
+
+  if (is.null(rf_optimal_ntree) || !length(rf_optimal_ntree) || !is.finite(rf_optimal_ntree)) {
+    rf_optimal_ntree <- rf_final_oob_error_curve$n_trees[[which.min(rf_final_oob_error_curve$oob_error)]]
+  }
+
+  rf_optimal_oob_error <- rf_final_oob_error_curve$oob_error[[
+    match(rf_optimal_ntree, rf_final_oob_error_curve$n_trees)
+  ]]
+  rf_optimal_oob_error_smoothed <- rf_final_oob_error_curve$oob_error_smoothed[[
+    match(rf_optimal_ntree, rf_final_oob_error_curve$n_trees)
+  ]]
+  rf_best_mtry <- holdout_results$final_model_output$tuning$mtry[[1]]
+  rf_ntree_selection_burn_in <- holdout_results$final_model_output$tuning$ntree_selection_burn_in[[1]]
+  rf_ntree_smoothing_window <- holdout_results$final_model_output$tuning$ntree_selection_smoothing_window[[1]]
+
+  write.csv(
+    rf_final_oob_error_curve,
+    "Tables/Random Forest OOB Error by Tree Count.csv",
+    row.names = FALSE
+  )
+
+  cat(
+    sprintf(
+      "<p>For the best random-forest fit at mtry = %d, the final tree count was set to %d using the minimum %d-tree moving-average OOB classification error after a %d-tree burn-in. The selected forest had raw OOB classification error %.3f and smoothed OOB classification error %.3f.</p>\n",
+      rf_best_mtry,
+      rf_optimal_ntree,
+      rf_ntree_smoothing_window,
+      rf_ntree_selection_burn_in,
+      rf_optimal_oob_error,
+      rf_optimal_oob_error_smoothed
+    )
+  )
+
+  rf_oob_error_curve_plot <- ggplot2::ggplot(
+    rf_final_oob_error_curve,
+    ggplot2::aes(x = n_trees)
+  ) +
+    ggplot2::geom_line(ggplot2::aes(y = oob_error), color = "#A6CEE3", linewidth = 0.8, alpha = 0.9) +
+    ggplot2::geom_line(ggplot2::aes(y = oob_error_smoothed), color = "#2C7FB8", linewidth = 1) +
+    ggplot2::geom_vline(xintercept = rf_ntree_selection_burn_in, linetype = "dotted", color = "gray50") +
+    ggplot2::geom_vline(xintercept = rf_optimal_ntree, linetype = "dashed", color = "#C65D3B") +
+    ggplot2::geom_point(
+      data = rf_final_oob_error_curve[
+        rf_final_oob_error_curve$n_trees == rf_optimal_ntree,
+        ,
+        drop = FALSE
+      ],
+      ggplot2::aes(y = oob_error_smoothed),
+      color = "#C65D3B",
+      size = 2.5
+    ) +
+    ggplot2::labs(
+      title = "Random Forest OOB Classification Error by Tree Count",
+      subtitle = sprintf(
+        "Best mtry = %d; selected at %d trees after %d-tree burn-in; dark line = %d-tree moving average",
+        rf_best_mtry,
+        rf_optimal_ntree,
+        rf_ntree_selection_burn_in,
+        rf_ntree_smoothing_window
+      ),
+      x = "Number of Trees",
+      y = "Out-of-Bag Classification Error"
+    ) +
+    ggplot2::theme_minimal()
+
+  print(rf_oob_error_curve_plot)
+}
+```
+
+## Final Random Forest Feature Importance
+
+```{r rf_feature_importance_table, echo=FALSE, results='asis'}
+rf_feature_importance_table <- holdout_results$final_model_output$feature_importance
+rf_feature_importance_table <- rf_feature_importance_table[
+  rf_feature_importance_table$variable_type == "miRNA",
+  ,
+  drop = FALSE
+]
+rf_feature_importance_table <- utils::head(rf_feature_importance_table, rf_importance_plot_top_n)
+
+if (!nrow(rf_feature_importance_table)) {
+  cat("<p>No miRNA feature-importance values were returned by the final random-forest model.</p>\n")
+} else {
+  cat(
+    sprintf(
+      "<p>The final random-forest miRNA list keeps the top %d miRNA ranked by %s from the best OOB forest.</p>\n",
+      sum(rf_feature_importance_table$selected_for_final),
+      rf_feature_importance_table$importance_metric[[1]]
+    )
+  )
+
+  knitr::kable(
+    transform(
+      rf_feature_importance_table[
+        ,
+        c(
+          "importance_rank",
+          "variable",
+          "importance_value",
+          "MeanDecreaseAccuracy",
+          "MeanDecreaseGini",
+          "selected_for_final"
+        )
+      ],
+      selected_for_final = ifelse(selected_for_final, "Yes", "No")
+    ),
+    format = "html",
+    row.names = FALSE,
+    digits = 3,
+    caption = "Random-forest miRNA feature-importance ranking on the final holdout model"
+  )
+}
+```
+
+```{r rf_feature_importance_plot, echo=FALSE, fig.width=8, fig.height=7}
+plot_feature_importance_ranking(
+  holdout_results$final_model_output$feature_importance,
+  model_label = "Random Forest",
+  top_n = rf_importance_plot_top_n,
+  variable_type = "miRNA"
+)
+```
+
+## Holdout ROC Curve
+
+```{r holdout_roc_plot, echo=FALSE, fig.width=6, fig.height=6}
+plot_model_roc_curve(
+  holdout_results$holdout_predictions,
+  model_label = "Random Forest",
+  dataset_label = "Holdout"
+)
+```
+
+```{r}
+
+```
