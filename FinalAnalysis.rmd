@@ -25,53 +25,16 @@ library(ggplot2)
 library(readr)
 
 source("R/plotHelpers.R")
+source("R/reportHelpers.R")
 source("R/multi_mir_analysis.R")
 
 report_start_time <- Sys.time()
-
-write_comma_separated_list <- function(items) {
-	if (length(items) == 0) {
-		return("")
-	} else if (length(items) == 1) {
-		return(items)
-	} else {
-		return(paste(
-			paste(items[-length(items)], collapse = ", "),
-			items[length(items)],
-			sep = ifelse(length(items) > 2, ", and ", " and ")
-		))
-	}
-}
-
-first_non_missing <- function(values) {
-	values <- values[!is.na(values) & values != ""]
-
-	if (length(values)) {
-		values[[1]]
-	} else {
-		NA_character_
-	}
-}
 
 ```
 
 ```{r report_table_styles, echo=FALSE, results='asis'}
 
-cat(
-	paste(
-		"<style>",
-		"table {",
-		"  border-collapse: collapse;",
-		"}",
-		"table th,",
-		"table td {",
-		"  border: 1px solid #cfcfcf;",
-		"  padding: 4px 8px;",
-		"}",
-		"</style>",
-		sep = "\n"
-	)
-)
+render_basic_table_styles()
 
 ```
 
@@ -93,7 +56,7 @@ if (!file.exists(downstream_analysis_inputs_rds_file)) {
 		paste(
 			"Downstream analysis input file not found:",
 			downstream_analysis_inputs_rds_file,
-			"Run PDACmiRNAAnalysis.rmd first to generate the saved consensus-feature inputs."
+			"Run PDACmiRNAAnalysis.rmd first to generate the saved downstream analysis inputs."
 		),
 		call. = TRUE
 	)
@@ -241,16 +204,16 @@ if (!is.finite(top_rank_count)) {
 
 ```
 
-# Multi-miRNA and Consensus Feature Analysis
+# Multi-miRNA and Downstream Feature Analysis
 
-This report loads the saved consensus-feature inputs written by the main PDAC modeling report and performs the downstream multiMiR and final consensus-feature summary analysis separately.
+This report loads the saved downstream inputs written by the main PDAC modeling report and performs the downstream multiMiR analysis plus summary tables for the top-ranked non-tree consensus miRNA set and the merged query set.
 
 ## Top-ranked Consensus miRNAs
 
 ```{r top_ranked_consensus_mirna, results='asis'}
 
 cat(
-	"<p>Loaded downstream consensus-feature inputs from ",
+	"<p>Loaded downstream analysis inputs from ",
 	downstream_analysis_inputs_rds_file,
 	". Top-rank selection count: ",
 	top_rank_count,
@@ -278,7 +241,7 @@ if (nrow(top_ranked_miRNA_details) > 1) {
 			"<p>Multiple miRNAs tied for the highest non-tree model-selection count, ",
 			"so the table is ordered by the smallest blocked-limma p-value, ",
 			"with ties broken by the absolute moderated t-statistic and then miRNA identifier. ",
-			"All rows in this table feed the downstream consensus-feature summary outputs.</p>\n"
+			"All rows in this table are retained as the downstream top-ranked consensus subset.</p>\n"
 		)
 	)
 }
@@ -832,29 +795,7 @@ cat(
 
 ```{r final_report_conclusion, results='asis'}
 
-report_end_time <- Sys.time()
-elapsed_seconds <- as.numeric(difftime(report_end_time, report_start_time, units = "secs"))
-
-format_elapsed_time <- function(elapsed_seconds) {
-	total_seconds <- max(0L, as.integer(round(elapsed_seconds)))
-	hours <- total_seconds %/% 3600L
-	minutes <- (total_seconds %% 3600L) %/% 60L
-	seconds <- total_seconds %% 60L
-
-	sprintf("%02d:%02d:%02d", hours, minutes, seconds)
-}
-
-cat(
-	paste0(
-		"<p>Report runtime: ",
-		format_elapsed_time(elapsed_seconds),
-		" (started ",
-		format(report_start_time, "%Y-%m-%d %H:%M:%S"),
-		"; finished ",
-		format(report_end_time, "%Y-%m-%d %H:%M:%S"),
-		").</p>\n"
-	)
-)
+render_report_runtime(report_start_time)
 
 ```
 

@@ -3,7 +3,9 @@ run_fold_rf <- function(
   ntree = 500,
   mtry_grid = c(5L, 10L, 20L, 30L),
   top_m_features = NULL,
-  importance_metric = c("MeanDecreaseAccuracy", "MeanDecreaseGini")
+  importance_metric = c("MeanDecreaseAccuracy", "MeanDecreaseGini"),
+  ntree_selection_burn_in = NULL,
+  ntree_selection_smoothing_window = NULL
 ) {
   importance_metric <- match.arg(importance_metric)
 
@@ -40,14 +42,69 @@ run_fold_rf <- function(
   best_fit_index <- which.min(oob_error)
   rf_search_fit <- rf_fits[[best_fit_index]]
   best_mtry <- candidate_mtry[[best_fit_index]]
+  oob_error_values <- as.numeric(rf_search_fit$err.rate[, "OOB"])
+  n_tree_counts <- length(oob_error_values)
+
+  if (is.null(ntree_selection_burn_in)) {
+    ntree_selection_burn_in <- min(
+      n_tree_counts,
+      max(25L, ceiling(0.05 * n_tree_counts))
+    )
+  } else {
+    ntree_selection_burn_in <- as.integer(ntree_selection_burn_in[[1]])
+
+    if (!is.finite(ntree_selection_burn_in) || ntree_selection_burn_in < 1L) {
+      stop("ntree_selection_burn_in must be NULL or a single positive integer.", call. = TRUE)
+    }
+
+    ntree_selection_burn_in <- min(ntree_selection_burn_in, n_tree_counts)
+  }
+
+  if (is.null(ntree_selection_smoothing_window)) {
+    ntree_selection_smoothing_window <- min(
+      n_tree_counts,
+      max(5L, min(25L, ceiling(0.05 * n_tree_counts)))
+    )
+  } else {
+    ntree_selection_smoothing_window <- as.integer(ntree_selection_smoothing_window[[1]])
+
+    if (!is.finite(ntree_selection_smoothing_window) || ntree_selection_smoothing_window < 1L) {
+      stop(
+        "ntree_selection_smoothing_window must be NULL or a single positive integer.",
+        call. = TRUE
+      )
+    }
+
+    ntree_selection_smoothing_window <- min(ntree_selection_smoothing_window, n_tree_counts)
+  }
+
+  half_window_before <- floor((ntree_selection_smoothing_window - 1L) / 2)
+  half_window_after <- ceiling((ntree_selection_smoothing_window - 1L) / 2)
+  smoothed_oob_error <- vapply(seq_len(n_tree_counts), function(tree_index) {
+    lower_index <- max(1L, tree_index - half_window_before)
+    upper_index <- min(n_tree_counts, tree_index + half_window_after)
+
+    mean(oob_error_values[lower_index:upper_index], na.rm = TRUE)
+  }, numeric(1))
+
+  eligible_for_selection <- seq_len(n_tree_counts) >= ntree_selection_burn_in
+  eligible_tree_indices <- which(eligible_for_selection)
+
+  if (!length(eligible_tree_indices)) {
+    eligible_tree_indices <- seq_len(n_tree_counts)
+    eligible_for_selection[] <- TRUE
+  }
+
+  optimal_ntree <- eligible_tree_indices[[which.min(smoothed_oob_error[eligible_tree_indices])]]
   oob_error_curve <- data.frame(
-    n_trees = seq_len(nrow(rf_search_fit$err.rate)),
-    oob_error = as.numeric(rf_search_fit$err.rate[, "OOB"]),
+    n_trees = seq_len(n_tree_counts),
+    oob_error = oob_error_values,
+    oob_error_smoothed = smoothed_oob_error,
+    eligible_for_selection = eligible_for_selection,
     mtry = best_mtry,
     stringsAsFactors = FALSE,
     check.names = FALSE
   )
-  optimal_ntree <- oob_error_curve$n_trees[[which.min(oob_error_curve$oob_error)]]
 
   rf_fit <- if (optimal_ntree < ntree) {
     randomForest::randomForest(
@@ -185,6 +242,9 @@ run_fold_rf <- function(
       optimal_ntree = optimal_ntree,
       oob_error = final_oob_error,
       oob_error_search_min = min(oob_error_curve$oob_error, na.rm = TRUE),
+      oob_error_smoothed_selected = oob_error_curve$oob_error_smoothed[[optimal_ntree]],
+      ntree_selection_burn_in = ntree_selection_burn_in,
+      ntree_selection_smoothing_window = ntree_selection_smoothing_window,
       importance_metric = importance_metric,
       top_m_features = length(selected_miRNA),
       stringsAsFactors = FALSE

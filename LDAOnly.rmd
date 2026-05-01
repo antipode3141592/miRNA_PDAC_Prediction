@@ -36,6 +36,7 @@ train_fraction <- 0.8
 k <- 10
 
 fold_filter_top_n <- 25
+limma_feature_p_value_threshold <- 0.1
 lda_prior <- c(0.5, 0.5)
 lda_max_features <- 20
 
@@ -70,6 +71,7 @@ analysis_inputs <- load_model_only_pipeline_data(
   limma_rds_file = limma_rds_file,
   filter_stat_cols = filter_stat_cols,
   fold_filter_top_n = fold_filter_top_n,
+  limma_p_value_threshold = limma_feature_p_value_threshold,
   limma_group_term = limma_group_term,
   limma_adjustment_covariates = limma_adjustment_covariates
 )
@@ -82,7 +84,7 @@ train_filter_results <- analysis_inputs$train_filter_results
 ```{r model_feature_pool, include=FALSE}
 selected_miRNA <- select_top_limma_miRNA(
   train_filter_results$stats,
-  top_n = fold_filter_top_n
+  p_value_threshold = limma_feature_p_value_threshold
 )$miRNA
 ```
 

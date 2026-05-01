@@ -35,7 +35,7 @@ train_fraction <- 0.8
 k <- 5
 
 fold_filter_top_n <- 25
-rf_ntree <- 5000
+rf_ntree <- 1000
 rf_mtry_grid <- c(5L, 10L, 20L, 30L)
 rf_top_m_features <- 10
 rf_importance_metric <- "MeanDecreaseAccuracy"
@@ -159,7 +159,12 @@ if (is.null(rf_final_oob_error_curve) || !nrow(rf_final_oob_error_curve)) {
   rf_optimal_oob_error <- rf_final_oob_error_curve$oob_error[[
     match(rf_optimal_ntree, rf_final_oob_error_curve$n_trees)
   ]]
+  rf_optimal_oob_error_smoothed <- rf_final_oob_error_curve$oob_error_smoothed[[
+    match(rf_optimal_ntree, rf_final_oob_error_curve$n_trees)
+  ]]
   rf_best_mtry <- holdout_results$final_model_output$tuning$mtry[[1]]
+  rf_ntree_selection_burn_in <- holdout_results$final_model_output$tuning$ntree_selection_burn_in[[1]]
+  rf_ntree_smoothing_window <- holdout_results$final_model_output$tuning$ntree_selection_smoothing_window[[1]]
 
   write.csv(
     rf_final_oob_error_curve,
@@ -169,18 +174,23 @@ if (is.null(rf_final_oob_error_curve) || !nrow(rf_final_oob_error_curve)) {
 
   cat(
     sprintf(
-      "<p>For the best random-forest fit at mtry = %d, the first minimum OOB classification error was %.3f at %d trees, and the final random-forest model was refit using that tree count.</p>\n",
+      "<p>For the best random-forest fit at mtry = %d, the final tree count was set to %d using the minimum %d-tree moving-average OOB classification error after a %d-tree burn-in. The selected forest had raw OOB classification error %.3f and smoothed OOB classification error %.3f.</p>\n",
       rf_best_mtry,
+      rf_optimal_ntree,
+      rf_ntree_smoothing_window,
+      rf_ntree_selection_burn_in,
       rf_optimal_oob_error,
-      rf_optimal_ntree
+      rf_optimal_oob_error_smoothed
     )
   )
 
   rf_oob_error_curve_plot <- ggplot2::ggplot(
     rf_final_oob_error_curve,
-    ggplot2::aes(x = n_trees, y = oob_error)
+    ggplot2::aes(x = n_trees)
   ) +
-    ggplot2::geom_line(color = "#2C7FB8", linewidth = 0.9) +
+    ggplot2::geom_line(ggplot2::aes(y = oob_error), color = "#A6CEE3", linewidth = 0.8, alpha = 0.9) +
+    ggplot2::geom_line(ggplot2::aes(y = oob_error_smoothed), color = "#2C7FB8", linewidth = 1) +
+    ggplot2::geom_vline(xintercept = rf_ntree_selection_burn_in, linetype = "dotted", color = "gray50") +
     ggplot2::geom_vline(xintercept = rf_optimal_ntree, linetype = "dashed", color = "#C65D3B") +
     ggplot2::geom_point(
       data = rf_final_oob_error_curve[
@@ -188,12 +198,19 @@ if (is.null(rf_final_oob_error_curve) || !nrow(rf_final_oob_error_curve)) {
         ,
         drop = FALSE
       ],
+      ggplot2::aes(y = oob_error_smoothed),
       color = "#C65D3B",
       size = 2.5
     ) +
     ggplot2::labs(
       title = "Random Forest OOB Classification Error by Tree Count",
-      subtitle = sprintf("Best mtry = %d; first minimum at %d trees", rf_best_mtry, rf_optimal_ntree),
+      subtitle = sprintf(
+        "Best mtry = %d; selected at %d trees after %d-tree burn-in; dark line = %d-tree moving average",
+        rf_best_mtry,
+        rf_optimal_ntree,
+        rf_ntree_selection_burn_in,
+        rf_ntree_smoothing_window
+      ),
       x = "Number of Trees",
       y = "Out-of-Bag Classification Error"
     ) +

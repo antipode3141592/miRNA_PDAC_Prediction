@@ -35,6 +35,7 @@ train_fraction <- 0.8
 k <- 10
 
 fold_filter_top_n <- 25
+limma_feature_p_value_threshold <- 0.1
 lasso_alpha_grid <- c(0.5, 0.6, 0.75, 0.9, 0.95, 1)
 
 demographic_covariates <- c("Sex", "Race", "Age")
@@ -68,6 +69,7 @@ analysis_inputs <- load_model_only_pipeline_data(
   limma_rds_file = limma_rds_file,
   filter_stat_cols = filter_stat_cols,
   fold_filter_top_n = fold_filter_top_n,
+  limma_p_value_threshold = limma_feature_p_value_threshold,
   limma_group_term = limma_group_term,
   limma_adjustment_covariates = limma_adjustment_covariates
 )
@@ -80,15 +82,34 @@ train_filter_results <- analysis_inputs$train_filter_results
 ```{r model_feature_pool, include=FALSE}
 selected_miRNA <- select_top_limma_miRNA(
   train_filter_results$stats,
-  top_n = fold_filter_top_n
+  p_value_threshold = limma_feature_p_value_threshold
 )$miRNA
+```
+
+```{r fixed_lasso_tuning, include=FALSE}
+lasso_tuning_inputs <- prepare_fold_inputs(
+  train_fold_dat = train_set,
+  valid_fold_dat = holdout,
+  selected_miRNA = selected_miRNA,
+  model_covariates = model_covariates,
+  factor_model_covariates = factor_demographic_covariates
+)
+
+lasso_fixed_tuning <- select_lasso_hyperparameters(
+  lasso_tuning_inputs,
+  alpha_lasso = lasso_alpha_grid
+)
 ```
 
 ```{r model_run, include=FALSE}
 model_runner <- function(fold_inputs) {
   run_fold_lasso(
     fold_inputs,
-    alpha_lasso = lasso_alpha_grid
+    alpha_lasso = lasso_fixed_tuning$alpha[[1]],
+    lambda_lasso = lasso_fixed_tuning$lambda[[1]],
+    tuning_cv_score = lasso_fixed_tuning$cv_score[[1]],
+    alpha_grid = lasso_fixed_tuning$alpha_grid[[1]],
+    tuning_source = lasso_fixed_tuning$tuning_source[[1]]
   )
 }
 
@@ -120,6 +141,7 @@ lasso_results <- list(
   train_filter_results = train_filter_results,
   selected_miRNA = selected_miRNA,
   alpha_grid = lasso_alpha_grid,
+  fixed_tuning = lasso_fixed_tuning,
   cv_predictions = cv_results$cv_predictions,
   cv_tuning = cv_results$cv_tuning,
   cv_feature_counts = cv_results$cv_feature_counts,
@@ -131,6 +153,7 @@ lasso_results <- list(
   holdout_predictions = holdout_results$holdout_predictions,
   holdout_summary = holdout_results$holdout_summary,
   final_alpha = lasso_final_alpha,
+  final_lambda = holdout_results$final_model_output$final_lambda,
   final_fold_inputs = holdout_results$final_fold_inputs,
   final_model_output = holdout_results$final_model_output
 )

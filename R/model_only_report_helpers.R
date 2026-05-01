@@ -1,23 +1,4 @@
-select_top_limma_miRNA <- function(limma_stats, top_n) {
-  ranked_stats <- limma_stats[
-    order(limma_stats$limma_p_value, -abs(limma_stats$limma_t), limma_stats$miRNA),
-    ,
-    drop = FALSE
-  ]
-
-  if (!nrow(ranked_stats)) {
-    return(ranked_stats)
-  }
-
-  cutoff_index <- min(top_n, nrow(ranked_stats))
-  cutoff_p_value <- ranked_stats$limma_p_value[[cutoff_index]]
-
-  ranked_stats[ranked_stats$limma_p_value <= cutoff_p_value, , drop = FALSE]
-}
-
-rank_blocked_limma_miRNA <- function(limma_stats) {
-  select_top_limma_miRNA(limma_stats, top_n = nrow(limma_stats))$miRNA
-}
+source("R/limma_helpers.R")
 
 build_binary_roc <- function(observed, predicted_prob) {
   if (!length(observed) || !length(predicted_prob)) {
@@ -180,6 +161,7 @@ load_model_only_pipeline_data <- function(
   limma_rds_file,
   filter_stat_cols,
   fold_filter_top_n,
+  limma_p_value_threshold = NULL,
   limma_group_term,
   limma_adjustment_covariates
 ) {
@@ -221,6 +203,7 @@ load_model_only_pipeline_data <- function(
       miRNA_cols = miRNA_all_columns,
       filter_stat_cols = filter_stat_cols,
       top_n = fold_filter_top_n,
+      p_value_threshold = limma_p_value_threshold,
       group_term = limma_group_term,
       adjustment_covariates = limma_adjustment_covariates
     )
@@ -239,6 +222,16 @@ load_model_only_pipeline_data <- function(
     }
 
     train_filter_results <- readRDS(limma_rds_file)
+  }
+
+  train_filter_results$selected <- select_top_limma_miRNA(
+    train_filter_results$stats,
+    top_n = fold_filter_top_n,
+    p_value_threshold = limma_p_value_threshold
+  )$miRNA
+
+  if (!length(train_filter_results$selected)) {
+    stop("Blocked limma selection yielded zero selected miRNAs under the current filter settings.", call. = TRUE)
   }
 
   list(
