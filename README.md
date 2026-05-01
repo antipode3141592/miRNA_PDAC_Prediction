@@ -1,18 +1,20 @@
 # PDAC Prediction with Circulating miRNA
 
-This repository contains the final project analysis pipeline for predicting pancreatic ductal adenocarcinoma (PDAC) from circulating miRNA measurements and demographics. The code is organized around one main modeling report and one downstream interpretation report.
+Authors: Madison Blake, Kristyn Gumpper-Fedus, Sean Kirkpatrick
+
+This repository contains the final project analysis pipeline for predicting pancreatic ductal adenocarcinoma (PDAC) from circulating miRNA measurements and demographics. The code is organized around one demographic report rmd, one main modeling report rmd, and one downstream interpretation report rmd with many support r files.  Included in the Data folder are the normalized miRNA and demographic original data files from GEO.
 
 ## Main reports
 
 ### `PDACmiRNAAnalysis.rmd`
 
-This is the primary modeling report. It:
+Primary modeling report:
 
-- loads the GEO-derived normalized miRNA matrix and sample metadata
-- applies the shared import-time `log2(x + 1)` transform
-- creates the matched-set-aware training and holdout split
+- loads the normalized miRNA and demographic data
+- `log2(x + 1)` transform
+- creates 80/20 training/holdout split
 - runs blocked limma on the training set
-- fits the six final model families
+- fits the six models
     - forward step logistic regression
     - lasso
     - elastic net
@@ -21,11 +23,11 @@ This is the primary modeling report. It:
     - decision tree
 - evaluates the final models on the holdout set
 - writes the main summary tables and figures to `Tables/` and `Figures/`
-- saves the downstream handoff object used by the second report
+- saves the downstream handoff RDS object used by the second report
 
 ### `FinalAnalysis.rmd`
 
-This is the downstream biology and annotation report. It does not rebuild the modeling pipeline. Instead, it reads the saved outputs from `PDACmiRNAAnalysis.rmd` and performs:
+This is the downstream biology and annotation report. It reads the saved outputs from `PDACmiRNAAnalysis.rmd`.  Originally part of the main report, but separated out due to online API dependencies, to more easily re-run only the final analysis in the event of network issues.
 
 - downstream multiMiR queries for the ranked miRNA set
 - validated target summaries
@@ -34,8 +36,6 @@ This is the downstream biology and annotation report. It does not rebuild the mo
 - merged summary tables that combine model-selection counts, limma statistics, and multiMiR results
 
 ## How the two reports interact
-
-The handoff between the two reports is explicit.
 
 `PDACmiRNAAnalysis.rmd` writes:
 
@@ -46,7 +46,7 @@ The handoff between the two reports is explicit.
 - `Tables/Blocked limma filter results on full training set.csv`
 - `Tables/Final Model Feature Counts.csv`
 
-`FinalAnalysis.rmd` then reads those files and uses them to build the downstream query set. In practice:
+`FinalAnalysis.rmd` then reads those files and uses them to build the downstream query set:
 
 1. The main report identifies the top-ranked non-tree consensus miRNA set.
 2. It merges those with the top tree-model features into `merged_top_features`.
@@ -66,20 +66,7 @@ Run the reports from the project root in this order:
 1. `PDACmiRNAAnalysis.rmd`
 2. `FinalAnalysis.rmd`
 
-Example from an R session:
-
-```r
-rmarkdown::render("PDACmiRNAAnalysis.rmd")
-rmarkdown::render("FinalAnalysis.rmd")
-```
-
-There is also a helper script for the main report:
-
-```r
-Rscript render_pdac_report.R
-```
-
-The main report is long-running on this dataset and can take about an hour to complete.
+The main report is long-running on this dataset and can take an hour or more to complete.
 
 ## Key directories
 
@@ -120,7 +107,6 @@ Optional GO enrichment output in `FinalAnalysis.rmd` also uses:
 - `clusterProfiler`
 - `org.Hs.eg.db`
 
-## Related report
+### Demographic Report `TableOnePDACAnalysis.rmd`
 
-`MultiMirAnalysis.rmd` is a related downstream report variant that uses the same `Data/Top-ranked consensus miRNA downstream inputs.rds` handoff pattern. The main end-to-end pair for this project is `PDACmiRNAAnalysis.rmd` followed by `FinalAnalysis.rmd`.
-
+This report was used to build the initial demographic analysis for our proposal and check for missing demographic data.
